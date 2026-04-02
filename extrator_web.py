@@ -44,7 +44,7 @@ DIC_TRIBUNAIS = {
 
 # --- INTERFACE ---
 st.set_page_config(page_title="Extrator Projuris Web", layout="wide")
-st.title("📂 Captura de Processos - Projuris ADV")
+st.title("📂 Extração de Capturas - Projuris ADV")
 
 with st.sidebar:
     st.header("Configurações")
