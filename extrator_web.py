@@ -10,15 +10,16 @@ URL_API_PROJURIS = "https://api.projurisadv.com.br/adv-service/consulta/central-
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
 except:
-    st.error("Erro: Configure o TOKEN_FORNECEDOR nos Secrets do Streamlit.")
+    st.error("Erro: TOKEN_FORNECEDOR não configurado nos Secrets.")
     st.stop()
 
-# --- MAPAS DE DADOS (Originais) ---
+# --- MAPAS DE DADOS ORIGINAIS ---
 MAPA_FILTROS = {
-    'VINCULADOS': 'VINCULADOS',
+    'ERRO': 'ERRO',
     'EM_ANDAMENTO': 'FILTRO_EM_ANDAMENTO',
     'PENDENTE': 'FILTRO_PENDENTES',
-    'ERRO': 'ERRO'
+    'VINCULADOS': 'VINCULADOS',
+    'OUTROS (Segredo/Credencial)': 'ERRO'
 }
 
 MAPA_CNJ = {
@@ -46,27 +47,27 @@ st.set_page_config(page_title="Extrator Projuris Web", layout="wide")
 st.title("📂 Captura de Processos - Projuris ADV")
 
 with st.sidebar:
-    st.header("Configurações de Acesso")
-    token_user = st.text_input("Seu Token (Bearer)", type="password", help="Cole o token gG-...")
+    st.header("Configurações")
+    token_user = st.text_input("Seu Token (Bearer)", type="password")
     cd_arrendatario = st.text_input("Arrendatário", value="60470")
-    status_usuario = st.selectbox("Status", list(MAPA_FILTROS.keys()))
+    status_usuario = st.selectbox("Status", list(MAPA_FILTROS.keys()), index=3) # Default VINCULADOS
     
     st.divider()
-    st.header("Filtros de Busca")
+    st.header("Filtros")
     ambito = st.selectbox("Âmbito", list(DIC_TRIBUNAIS.keys()))
     tribunal_sigla = st.selectbox("Tribunal", DIC_TRIBUNAIS[ambito])
 
-# --- BOTÃO DE AÇÃO ---
 if st.button("🚀 Iniciar Extração"):
     if not token_user:
-        st.error("Por favor, insira o seu Token.")
+        st.error("Insira o Token.")
     else:
         with st.status("Extraindo processos...", expanded=True) as status_box:
             try:
                 headers = {
                     "Authorization": f"Bearer {token_user.strip()}",
                     "Content-Type": "application/json",
-                    "Accept": "application/json"
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0"
                 }
 
                 filtro_api = MAPA_FILTROS.get(status_usuario)
@@ -74,18 +75,32 @@ if st.button("🚀 Iniciar Extração"):
                 
                 dados_brutos = []
                 
+                # --- LÓGICA DE COLETA IGUAL AO EXE ---
                 for f in filtros_api_lista:
                     if dados_brutos: break
-                    st.write(f"🔍 Consultando {f}...")
-                    res = requests.post(URL_API_PROJURIS, headers=headers, params={"quan-registros": 500, "pagina": 0}, json={"habilitado": True, "tipoFiltroConsulta": f})
-                    
-                    if res.status_code == 200:
-                        itens = res.json().get('centralCapturaProcessoConsultaResultadoWs', [])
+                    st.write(f"🛰️ Consultando {f}...")
+                    pagina = 0
+                    while True:
+                        payload = {"habilitado": True, "tipoFiltroConsulta": f}
+                        res = requests.post(URL_API_PROJURIS, headers=headers, params={"quan-registros": 100, "pagina": pagina}, json=payload, timeout=30)
+                        
+                        if res.status_code != 200:
+                            if res.status_code == 412:
+                                st.error(f"Erro 412: Verifique se o Arrendatário {cd_arrendatario} está correto para este Token.")
+                            break
+                        
+                        data = res.json()
+                        itens = data.get('centralCapturaProcessoConsultaResultadoWs', [])
+                        if not itens: break
+                        
                         dados_brutos.extend(itens)
-                    else:
-                        st.error(f"Erro na API ({f}): {res.status_code}")
-                
-                # Filtragem de Tribunal
+                        st.write(f"📥 Coletados: {len(dados_brutos)}...")
+                        
+                        if len(dados_brutos) >= data.get('totalRegistros', 0): break
+                        pagina += 1
+                        time.sleep(0.05)
+
+                # --- FILTRAGEM ---
                 cod_ambito = {"JUSTIÇA FEDERAL": ".4.", "JUSTIÇA DO TRABALHO": ".5.", "JUSTIÇA ESTADUAL": ".8."}.get(ambito, "")
                 processos_filtrados = []
 
@@ -105,32 +120,43 @@ if st.button("🚀 Iniciar Extração"):
                     if match:
                         processos_filtrados.append({
                             "Processo": num_proc, "Tribunal": item.get('tribunal'), 
-                            "Justiça": item.get('justica'), "id_central": item.get('codigoCentralCapturaProcesso')
+                            "id_central": item.get('codigoCentralCapturaProcesso')
                         })
 
                 if not processos_filtrados:
-                    st.warning("Nenhum processo encontrado com esses filtros.")
+                    st.warning("Nenhum processo encontrado.")
                 else:
-                    st.write(f"✅ {len(processos_filtrados)} processos filtrados. Gerando planilha...")
+                    # --- BUSCA DE DEMANDAS (IGUAL AO EXE) ---
+                    st.write(f"🔍 {len(processos_filtrados)} filtrados. Buscando Demandas...")
+                    finais = []
+                    progress_bar = st.progress(0)
+                    for idx, p in enumerate(processos_filtrados):
+                        url_f = f"https://broly.sajadv.com.br/api/acompanhamento?token={TOKEN_FORNECEDOR}&cdArrendatario={cd_arrendatario}&cdCentralCapturaProcesso={p['id_central']}"
+                        id_demanda = "N/A"
+                        try:
+                            rf = requests.get(url_f, timeout=10)
+                            if rf.status_code == 200: id_demanda = rf.json().get('idDemanda') or "N/A"
+                        except: pass
+                        finais.append({"Processo": p['Processo'], "Tribunal": p['Tribunal'], "ID Demanda": id_demanda, "Link": url_f})
+                        progress_bar.progress((idx + 1) / len(processos_filtrados))
                     
-                    # Criar DataFrame e Excel
-                    df_final = pd.DataFrame(processos_filtrados)
+                    df_final = pd.DataFrame(finais)
                     
+                    # Gerar Excel
                     output = BytesIO()
                     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                         df_final.to_excel(writer, index=False)
                     
-                    # Nome do arquivo conforme solicitado
-                    nome_arquivo = f"{cd_arrendatario} - {ambito} - {tribunal_sigla} - {status_usuario}.xlsx".replace("/", "_")
+                    # Nome do arquivo idêntico ao original
+                    nome_arquivo = f"{status_usuario} - {ambito} - {tribunal_sigla} - {cd_arrendatario}.xlsx".replace("/", "_")
                     
-                    status_box.update(label="Extração finalizada!", state="complete")
-                    
+                    status_box.update(label="✅ Extração concluída!", state="complete")
                     st.download_button(
-                        label="📥 Clique para Baixar Planilha",
+                        label="📥 Baixar Planilha Excel",
                         data=output.getvalue(),
                         file_name=nome_arquivo,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
 
             except Exception as e:
-                st.error(f"Ocorreu um erro inesperado: {e}")
+                st.error(f"Erro: {e}")
