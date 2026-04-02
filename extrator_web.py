@@ -48,9 +48,9 @@ st.title("📂 Captura de Processos - Projuris ADV")
 
 with st.sidebar:
     st.header("Configurações")
-    token_user = st.text_input("Seu Token (Bearer)", type="password")
+    token_user_raw = st.text_input("Seu Token (com ou sem Bearer)", type="password")
     cd_arrendatario = st.text_input("Arrendatário", value="60470")
-    status_usuario = st.selectbox("Status", list(MAPA_FILTROS.keys()), index=3) # Default VINCULADOS
+    status_usuario = st.selectbox("Status", list(MAPA_FILTROS.keys()), index=3)
     
     st.divider()
     st.header("Filtros")
@@ -58,13 +58,20 @@ with st.sidebar:
     tribunal_sigla = st.selectbox("Tribunal", DIC_TRIBUNAIS[ambito])
 
 if st.button("🚀 Iniciar Extração"):
-    if not token_user:
+    if not token_user_raw:
         st.error("Insira o Token.")
     else:
         with st.status("Extraindo processos...", expanded=True) as status_box:
             try:
+                # --- LÓGICA DE TOKEN FLEXÍVEL ---
+                token_limpo = token_user_raw.strip()
+                if not token_limpo.lower().startswith("bearer "):
+                    token_final = f"Bearer {token_limpo}"
+                else:
+                    token_final = token_limpo
+
                 headers = {
-                    "Authorization": f"Bearer {token_user.strip()}",
+                    "Authorization": token_final,
                     "Content-Type": "application/json",
                     "Accept": "application/json",
                     "User-Agent": "Mozilla/5.0"
@@ -75,7 +82,6 @@ if st.button("🚀 Iniciar Extração"):
                 
                 dados_brutos = []
                 
-                # --- LÓGICA DE COLETA IGUAL AO EXE ---
                 for f in filtros_api_lista:
                     if dados_brutos: break
                     st.write(f"🛰️ Consultando {f}...")
@@ -86,7 +92,7 @@ if st.button("🚀 Iniciar Extração"):
                         
                         if res.status_code != 200:
                             if res.status_code == 412:
-                                st.error(f"Erro 412: Verifique se o Arrendatário {cd_arrendatario} está correto para este Token.")
+                                st.error(f"Erro 412: Verifique o Arrendatário ou o Token.")
                             break
                         
                         data = res.json()
@@ -126,7 +132,6 @@ if st.button("🚀 Iniciar Extração"):
                 if not processos_filtrados:
                     st.warning("Nenhum processo encontrado.")
                 else:
-                    # --- BUSCA DE DEMANDAS (IGUAL AO EXE) ---
                     st.write(f"🔍 {len(processos_filtrados)} filtrados. Buscando Demandas...")
                     finais = []
                     progress_bar = st.progress(0)
@@ -142,12 +147,10 @@ if st.button("🚀 Iniciar Extração"):
                     
                     df_final = pd.DataFrame(finais)
                     
-                    # Gerar Excel
                     output = BytesIO()
                     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                         df_final.to_excel(writer, index=False)
                     
-                    # Nome do arquivo idêntico ao original
                     nome_arquivo = f"{status_usuario} - {ambito} - {tribunal_sigla} - {cd_arrendatario}.xlsx".replace("/", "_")
                     
                     status_box.update(label="✅ Extração concluída!", state="complete")
