@@ -49,7 +49,7 @@ st.title("📂 Captura de Processos - Projuris ADV")
 with st.sidebar:
     st.header("Configurações")
     token_user_raw = st.text_input("Seu Token (com ou sem Bearer)", type="password")
-    cd_arrendatario = st.text_input("Arrendatário", value="60470")
+    cd_arrendatario = st.text_input("Arrendatário", value="")
     status_usuario = st.selectbox("Status", list(MAPA_FILTROS.keys()), index=3)
     
     st.divider()
