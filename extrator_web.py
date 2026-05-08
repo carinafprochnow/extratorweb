@@ -50,7 +50,7 @@ with st.sidebar:
     st.header("Configurações")
     token_user_raw = st.text_input("Token", type="password")
     cd_arrendatario = st.text_input("Arrendatário", value="")
-    status_usuario = st.selectbox("Status", list(MAPA_FILTROS.keys()), index=3)
+    status_usuario = st.selectbox("Status", list(MAPA_FILTROS.keys()), index=2) # Index 2 é PENDENTE agora
     
     st.divider()
     st.header("Filtros")
@@ -65,10 +65,7 @@ if st.button("🚀 Iniciar Extração"):
             try:
                 # --- LÓGICA DE TOKEN FLEXÍVEL ---
                 token_limpo = token_user_raw.strip()
-                if not token_limpo.lower().startswith("bearer "):
-                    token_final = f"Bearer {token_limpo}"
-                else:
-                    token_final = token_limpo
+                token_final = token_limpo if token_limpo.lower().startswith("bearer ") else f"Bearer {token_limpo}"
 
                 headers = {
                     "Authorization": token_final,
@@ -83,7 +80,6 @@ if st.button("🚀 Iniciar Extração"):
                 dados_brutos = []
                 
                 for f in filtros_api_lista:
-                    if dados_brutos: break
                     st.write(f"🛰️ Consultando {f}...")
                     pagina = 0
                     while True:
@@ -106,13 +102,19 @@ if st.button("🚀 Iniciar Extração"):
                         pagina += 1
                         time.sleep(0.05)
 
-                # --- FILTRAGEM ---
+                # --- FILTRAGEM (CORRIGIDA) ---
                 cod_ambito = {"JUSTIÇA FEDERAL": ".4.", "JUSTIÇA DO TRABALHO": ".5.", "JUSTIÇA ESTADUAL": ".8."}.get(ambito, "")
                 processos_filtrados = []
 
                 for item in dados_brutos:
-                    caps = item.get('processoCapturados', [])
-                    val_num = caps[0].get('numeroProcesso') if caps else item.get('paramentroCaptura')
+                    # ALTERAÇÃO AQUI: Priorizamos o paramentroCaptura (o primeiro do seu JSON)
+                    val_num = item.get('paramentroCaptura')
+                    
+                    # Se por algum motivo o parâmetro estiver vazio, aí sim olhamos a lista interna
+                    if not val_num:
+                        caps = item.get('processoCapturados', [])
+                        val_num = caps[0].get('numeroProcesso') if caps else None
+
                     num_proc = str(val_num).strip() if val_num else "N/A"
                     
                     match = False
@@ -125,7 +127,8 @@ if st.button("🚀 Iniciar Extração"):
 
                     if match:
                         processos_filtrados.append({
-                            "Processo": num_proc, "Tribunal": item.get('tribunal'), 
+                            "Processo": num_proc, 
+                            "Tribunal": item.get('tribunal'), 
                             "id_central": item.get('codigoCentralCapturaProcesso')
                         })
 
@@ -146,6 +149,9 @@ if st.button("🚀 Iniciar Extração"):
                         progress_bar.progress((idx + 1) / len(processos_filtrados))
                     
                     df_final = pd.DataFrame(finais)
+                    
+                    # Remover duplicidade mantendo pelo menos um registro (conforme instrução)
+                    df_final = df_final.drop_duplicates(subset=['Processo'], keep='first')
                     
                     output = BytesIO()
                     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
