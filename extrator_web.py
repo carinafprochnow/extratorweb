@@ -4,7 +4,6 @@ import pandas as pd
 import time
 from io import BytesIO
 
-# --- CONFIGURAÇÕES FIXAS (Secrets) ---
 URL_API_PROJURIS = "https://api.projurisadv.com.br/adv-service/consulta/central-captura-processo"
 
 try:
@@ -63,7 +62,6 @@ if st.button("🚀 Iniciar Extração"):
     else:
         with st.status("Extraindo processos...", expanded=True) as status_box:
             try:
-                # --- LÓGICA DE TOKEN FLEXÍVEL ---
                 token_limpo = token_user_raw.strip()
                 token_final = token_limpo if token_limpo.lower().startswith("bearer ") else f"Bearer {token_limpo}"
 
@@ -102,15 +100,13 @@ if st.button("🚀 Iniciar Extração"):
                         pagina += 1
                         time.sleep(0.05)
 
-                # --- FILTRAGEM (CORRIGIDA) ---
+                # --- FILTRAGEM ---
                 cod_ambito = {"JUSTIÇA FEDERAL": ".4.", "JUSTIÇA DO TRABALHO": ".5.", "JUSTIÇA ESTADUAL": ".8."}.get(ambito, "")
                 processos_filtrados = []
 
                 for item in dados_brutos:
-                    # ALTERAÇÃO AQUI: Priorizamos o paramentroCaptura (o primeiro do seu JSON)
                     val_num = item.get('paramentroCaptura')
                     
-                    # Se por algum motivo o parâmetro estiver vazio, aí sim olhamos a lista interna
                     if not val_num:
                         caps = item.get('processoCapturados', [])
                         val_num = caps[0].get('numeroProcesso') if caps else None
