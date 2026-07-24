@@ -22,9 +22,10 @@ TIMEOUT_LEITURA_PROJURIS = 120
 TIMEOUT_LEITURA_ACOMPANHAMENTO = 60
 MAX_TENTATIVAS_PAGINA = 5
 MAX_TENTATIVAS_DEMANDA = 4
-MAX_THREADS_PADRAO = 10
+MAX_THREADS = 20
 INTERVALO_CHECKPOINT = 50
 PAUSA_ENTRE_PAGINAS = 0.5
+VERSAO_CHECKPOINT = "v2"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -60,15 +61,21 @@ MAPA_CNJ = {
 
 DIC_TRIBUNAIS = {
     "TODOS": ["TODOS"],
-    "JUSTIÇA FEDERAL": ["TODOS"] + sorted(k for k in MAPA_CNJ if k.startswith("TRF")),
-    "JUSTIÇA DO TRABALHO": ["TODOS"] + sorted(k for k in MAPA_CNJ if k.startswith("TRT")),
-    "JUSTIÇA ESTADUAL": ["TODOS"] + sorted(k for k in MAPA_CNJ if k.startswith("TJ")),
+    "JUSTIÇA FEDERAL": ["TODOS"] + sorted(
+        k for k in MAPA_CNJ if k.startswith("TRF")
+    ),
+    "JUSTIÇA DO TRABALHO": ["TODOS"] + sorted(
+        k for k in MAPA_CNJ if k.startswith("TRT")
+    ),
+    "JUSTIÇA ESTADUAL": ["TODOS"] + sorted(
+        k for k in MAPA_CNJ if k.startswith("TJ")
+    ),
 }
 
 _thread_local = threading.local()
 
 
-def criar_sessao_http(max_threads=MAX_THREADS_PADRAO):
+def criar_sessao_http():
     retry = Retry(
         total=3,
         connect=3,
@@ -79,20 +86,24 @@ def criar_sessao_http(max_threads=MAX_THREADS_PADRAO):
         allowed_methods=["GET", "POST"],
         raise_on_status=False,
     )
+
     adapter = HTTPAdapter(
         max_retries=retry,
-        pool_connections=max_threads + 5,
-        pool_maxsize=max_threads + 5,
+        pool_connections=MAX_THREADS + 5,
+        pool_maxsize=MAX_THREADS + 5,
     )
+
     sessao = requests.Session()
     sessao.mount("https://", adapter)
     sessao.mount("http://", adapter)
+
     return sessao
 
 
 def obter_sessao_thread():
     if not hasattr(_thread_local, "sessao"):
         _thread_local.sessao = criar_sessao_http()
+
     return _thread_local.sessao
 
 
@@ -100,27 +111,39 @@ def limpar_nome_arquivo(valor):
     valor = str(valor or "").strip()
     valor = re.sub(r'[\\/:*?"<>|]', "_", valor)
     valor = re.sub(r"\s+", " ", valor)
+
     return valor or "arquivo"
 
 
 def limpar_identificador(valor):
     valor = str(valor or "").strip()
     valor = re.sub(r"[^a-zA-Z0-9_-]+", "_", valor)
+
     return valor[:80] or "sem_valor"
 
 
-def gerar_caminho_checkpoint(token_usuario, cd_arrendatario, status_usuario, ambito, tribunal_sigla):
+def gerar_caminho_checkpoint(
+    token_usuario,
+    cd_arrendatario,
+    status_usuario,
+    ambito,
+    tribunal_sigla,
+):
     identificador = "|".join([
+        VERSAO_CHECKPOINT,
         token_usuario,
         cd_arrendatario,
         status_usuario,
         ambito,
         tribunal_sigla,
     ])
+
     hash_execucao = hashlib.sha256(
         identificador.encode("utf-8")
     ).hexdigest()[:16]
+
     arrendatario_seguro = limpar_identificador(cd_arrendatario)
+
     return os.path.join(
         "/tmp",
         f"checkpoint_projuris_{arrendatario_seguro}_{hash_execucao}.csv",
@@ -130,19 +153,33 @@ def gerar_caminho_checkpoint(token_usuario, cd_arrendatario, status_usuario, amb
 def salvar_checkpoint(resultados, caminho):
     if not resultados:
         return
+
     df = pd.DataFrame(resultados)
     df = df.drop_duplicates(subset=["Processo"], keep="last")
+
     caminho_temporario = f"{caminho}.tmp"
-    df.to_csv(caminho_temporario, index=False, encoding="utf-8-sig")
+
+    df.to_csv(
+        caminho_temporario,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
     os.replace(caminho_temporario, caminho)
 
 
 def carregar_checkpoint(caminho):
     if not os.path.exists(caminho):
         return []
+
     try:
-        df = pd.read_csv(caminho, dtype=str, encoding="utf-8-sig")
-        colunas = {
+        df = pd.read_csv(
+            caminho,
+            dtype=str,
+            encoding="utf-8-sig",
+        )
+
+        colunas_esperadas = {
             "Processo",
             "Tribunal",
             "ID Central",
@@ -150,11 +187,18 @@ def carregar_checkpoint(caminho):
             "Situação",
             "Link",
         }
-        if not colunas.issubset(set(df.columns)):
+
+        if not colunas_esperadas.issubset(set(df.columns)):
             return []
+
         df = df.fillna("N/A")
-        df = df.drop_duplicates(subset=["Processo"], keep="last")
+        df = df.drop_duplicates(
+            subset=["Processo"],
+            keep="last",
+        )
+
         return df.to_dict(orient="records")
+
     except Exception:
         return []
 
@@ -164,10 +208,12 @@ def consultar_pagina_projuris(sessao, headers, filtro, pagina):
         "habilitado": True,
         "tipoFiltroConsulta": filtro,
     }
+
     parametros = {
         "quan-registros": QUANTIDADE_POR_PAGINA,
         "pagina": pagina,
     }
+
     ultimo_erro = None
 
     for tentativa in range(1, MAX_TENTATIVAS_PAGINA + 1):
@@ -177,32 +223,44 @@ def consultar_pagina_projuris(sessao, headers, filtro, pagina):
                 headers=headers,
                 params=parametros,
                 json=payload,
-                timeout=(TIMEOUT_CONEXAO, TIMEOUT_LEITURA_PROJURIS),
+                timeout=(
+                    TIMEOUT_CONEXAO,
+                    TIMEOUT_LEITURA_PROJURIS,
+                ),
             )
+
         except requests.exceptions.ReadTimeout:
             ultimo_erro = (
                 f"A API demorou mais de {TIMEOUT_LEITURA_PROJURIS} "
                 "segundos para responder."
             )
+
         except requests.exceptions.ConnectTimeout:
-            ultimo_erro = "O tempo limite de conexão com a API foi atingido."
+            ultimo_erro = (
+                "O tempo limite de conexão com a API foi atingido."
+            )
+
         except requests.exceptions.ConnectionError as erro:
             ultimo_erro = f"Erro de conexão: {erro}"
+
         except requests.exceptions.RequestException as erro:
             ultimo_erro = f"Erro na requisição: {erro}"
 
         if tentativa < MAX_TENTATIVAS_PAGINA:
             espera = tentativa * 5
+
             st.warning(
-                f"⏳ Página {pagina}: tentativa {tentativa}/"
-                f"{MAX_TENTATIVAS_PAGINA} falhou. "
-                f"Nova tentativa em {espera} segundos."
+                f"⏳ A página {pagina} demorou para responder. "
+                f"Nova tentativa {tentativa + 1} de "
+                f"{MAX_TENTATIVAS_PAGINA} em {espera} segundos."
             )
+
             time.sleep(espera)
 
     raise RuntimeError(
         f"Não foi possível consultar a página {pagina} após "
-        f"{MAX_TENTATIVAS_PAGINA} tentativas. Último erro: {ultimo_erro}"
+        f"{MAX_TENTATIVAS_PAGINA} tentativas. "
+        f"Último erro: {ultimo_erro}"
     )
 
 
@@ -210,14 +268,24 @@ def extrair_numero_processo(item):
     valor = item.get("paramentroCaptura")
 
     if not valor:
-        processos_capturados = item.get("processoCapturados", [])
+        processos_capturados = item.get(
+            "processoCapturados",
+            [],
+        )
+
         if processos_capturados:
-            valor = processos_capturados[0].get("numeroProcesso")
+            valor = processos_capturados[0].get(
+                "numeroProcesso"
+            )
 
     return str(valor).strip() if valor else "N/A"
 
 
-def processo_corresponde_ao_filtro(numero_processo, ambito, tribunal_sigla):
+def processo_corresponde_ao_filtro(
+    numero_processo,
+    ambito,
+    tribunal_sigla,
+):
     if ambito == "TODOS":
         return True
 
@@ -233,23 +301,25 @@ def processo_corresponde_ao_filtro(numero_processo, ambito, tribunal_sigla):
         return codigo_ambito in numero_processo
 
     codigo_especifico = MAPA_CNJ.get(tribunal_sigla)
-    return bool(codigo_especifico and codigo_especifico in numero_processo)
+
+    return bool(
+        codigo_especifico
+        and codigo_especifico in numero_processo
+    )
 
 
 def identificar_tribunal(numero_processo, tribunal_api):
-    """
-    Identifica a sigla do tribunal pelo número CNJ.
-
-    Isso garante que os arquivos sejam separados por TJSC, TJSP,
-    TRT12, TRF4 etc., mesmo que o campo 'tribunal' da API venha
-    com outro formato.
-    """
     for sigla, codigo in MAPA_CNJ.items():
         if codigo in numero_processo:
             return sigla
 
     tribunal_api = str(tribunal_api or "").strip()
-    return tribunal_api if tribunal_api else "TRIBUNAL_NAO_IDENTIFICADO"
+
+    return (
+        tribunal_api
+        if tribunal_api
+        else "TRIBUNAL_NAO_IDENTIFICADO"
+    )
 
 
 def montar_link_completo(cd_arrendatario, id_central):
@@ -291,18 +361,39 @@ def buscar_id_demanda(cd_arrendatario, id_central):
             if resposta.status_code == 200:
                 try:
                     dados = resposta.json()
+
                 except ValueError:
-                    return "N/A", "RESPOSTA JSON INVÁLIDA", link_completo
+                    return (
+                        "N/A",
+                        "RESPOSTA JSON INVÁLIDA",
+                        link_completo,
+                    )
 
                 id_demanda = dados.get("idDemanda")
 
                 if id_demanda:
-                    return str(id_demanda), "SUCESSO", link_completo
+                    return (
+                        str(id_demanda),
+                        "SUCESSO",
+                        link_completo,
+                    )
 
-                return "N/A", "ID NÃO ENCONTRADO", link_completo
+                return (
+                    "N/A",
+                    "ID NÃO ENCONTRADO",
+                    link_completo,
+                )
 
-            if resposta.status_code in [429, 500, 502, 503, 504]:
-                ultimo_erro = f"ERRO HTTP {resposta.status_code}"
+            if resposta.status_code in [
+                429,
+                500,
+                502,
+                503,
+                504,
+            ]:
+                ultimo_erro = (
+                    f"ERRO HTTP {resposta.status_code}"
+                )
 
                 if tentativa < MAX_TENTATIVAS_DEMANDA:
                     time.sleep(tentativa * 2)
@@ -316,10 +407,13 @@ def buscar_id_demanda(cd_arrendatario, id_central):
 
         except requests.exceptions.ReadTimeout:
             ultimo_erro = "TIMEOUT DE LEITURA"
+
         except requests.exceptions.ConnectTimeout:
             ultimo_erro = "TIMEOUT DE CONEXÃO"
+
         except requests.exceptions.ConnectionError as erro:
             ultimo_erro = f"ERRO DE CONEXÃO: {erro}"
+
         except requests.exceptions.RequestException as erro:
             ultimo_erro = f"ERRO NA REQUISIÇÃO: {erro}"
 
@@ -378,7 +472,10 @@ def consultar_processo(processo, cd_arrendatario):
 def gerar_excel_tribunal(df_tribunal):
     output = BytesIO()
 
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(
+        output,
+        engine="xlsxwriter",
+    ) as writer:
         df_tribunal.to_excel(
             writer,
             index=False,
@@ -398,7 +495,9 @@ def gerar_excel_tribunal(df_tribunal):
             "underline": 1,
         })
 
-        for numero_coluna, nome_coluna in enumerate(df_tribunal.columns):
+        for numero_coluna, nome_coluna in enumerate(
+            df_tribunal.columns
+        ):
             worksheet.write(
                 0,
                 numero_coluna,
@@ -419,7 +518,10 @@ def gerar_excel_tribunal(df_tribunal):
                 df_tribunal["Link"],
                 start=1,
             ):
-                if isinstance(link, str) and link.startswith("http"):
+                if (
+                    isinstance(link, str)
+                    and link.startswith("http")
+                ):
                     worksheet.write_url(
                         indice,
                         coluna_link,
@@ -438,10 +540,15 @@ def gerar_excel_tribunal(df_tribunal):
         worksheet.freeze_panes(1, 0)
 
     output.seek(0)
+
     return output
 
 
-def gerar_zip_por_tribunal(df_final, status_usuario, cd_arrendatario):
+def gerar_zip_por_tribunal(
+    df_final,
+    status_usuario,
+    cd_arrendatario,
+):
     zip_output = BytesIO()
 
     with zipfile.ZipFile(
@@ -449,7 +556,6 @@ def gerar_zip_por_tribunal(df_final, status_usuario, cd_arrendatario):
         mode="w",
         compression=zipfile.ZIP_DEFLATED,
     ) as arquivo_zip:
-
         grupos = df_final.groupby(
             "Tribunal",
             dropna=False,
@@ -462,7 +568,8 @@ def gerar_zip_por_tribunal(df_final, status_usuario, cd_arrendatario):
             )
 
             nome_excel = limpar_nome_arquivo(
-                f"{status_usuario} - {tribunal_nome} - "
+                f"{status_usuario} - "
+                f"{tribunal_nome} - "
                 f"{cd_arrendatario}.xlsx"
             )
 
@@ -476,6 +583,7 @@ def gerar_zip_por_tribunal(df_final, status_usuario, cd_arrendatario):
             )
 
     zip_output.seek(0)
+
     return zip_output
 
 
@@ -489,60 +597,51 @@ st.title("📂 Extração de Capturas - Projuris ADV")
 with st.sidebar:
     st.header("Configurações")
 
-    with st.form("formulario_extracao"):
-        token_user_raw = st.text_input(
-            "Token",
-            type="password",
-        )
+    token_user_raw = st.text_input(
+        "Token",
+        type="password",
+    )
 
-        cd_arrendatario = st.text_input(
-            "Arrendatário",
-            value="",
-        )
+    cd_arrendatario = st.text_input(
+        "Arrendatário",
+        value="",
+    )
 
-        status_usuario = st.selectbox(
-            "Status",
-            list(MAPA_FILTROS.keys()),
-            index=2,
-        )
+    status_usuario = st.selectbox(
+        "Status",
+        list(MAPA_FILTROS.keys()),
+        index=2,
+    )
 
-        st.divider()
-        st.header("Filtros")
+    st.divider()
+    st.header("Filtros")
 
-        ambito = st.selectbox(
-            "Âmbito",
-            list(DIC_TRIBUNAIS.keys()),
-        )
+    ambito = st.selectbox(
+        "Âmbito",
+        list(DIC_TRIBUNAIS.keys()),
+    )
 
-        tribunal_sigla = st.selectbox(
-            "Tribunal",
-            DIC_TRIBUNAIS[ambito],
-        )
+    tribunal_sigla = st.selectbox(
+        "Tribunal",
+        DIC_TRIBUNAIS[ambito],
+    )
 
-        st.divider()
-        st.header("Desempenho")
+    st.divider()
 
-        quantidade_threads = st.slider(
-            "Consultas simultâneas no Broly",
-            min_value=1,
-            max_value=20,
-            value=MAX_THREADS_PADRAO,
-            help=(
-                "Recomenda-se usar 10. Valores muito altos podem "
-                "sobrecarregar a API ou provocar erro 429."
-            ),
-        )
+    retomar_checkpoint = st.checkbox(
+        "Retomar extração interrompida",
+        value=True,
+        help=(
+            "Se uma execução anterior foi interrompida, "
+            "o extrator tenta reaproveitar os resultados "
+            "que já haviam sido consultados."
+        ),
+    )
 
-        retomar_checkpoint = st.checkbox(
-            "Retomar extração interrompida",
-            value=True,
-        )
-
-        iniciar_extracao = st.form_submit_button(
-            "🚀 Iniciar Extração",
-            type="primary",
-        )
-
+iniciar_extracao = st.button(
+    "🚀 Iniciar Extração",
+    type="primary",
+)
 
 if iniciar_extracao:
     if not token_user_raw:
@@ -556,15 +655,11 @@ if iniciar_extracao:
             "Extraindo processos...",
             expanded=True,
         ) as status_box:
-
             caminho_checkpoint = None
             resultados_finais = []
 
             try:
-                sessao_principal = criar_sessao_http(
-                    quantidade_threads
-                )
-
+                sessao_principal = criar_sessao_http()
                 token_limpo = token_user_raw.strip()
 
                 token_final = (
@@ -588,9 +683,7 @@ if iniciar_extracao:
                     tribunal_sigla,
                 )
 
-                filtro_api = MAPA_FILTROS.get(
-                    status_usuario
-                )
+                filtro_api = MAPA_FILTROS.get(status_usuario)
 
                 filtros_api_lista = (
                     ["VINCULADOS", "PROCESSO_VINCULADO"]
@@ -601,9 +694,7 @@ if iniciar_extracao:
                 dados_brutos = []
 
                 for filtro_atual in filtros_api_lista:
-                    st.write(
-                        f"🛰️ Consultando filtro {filtro_atual}..."
-                    )
+                    st.write("🛰️ Consultando registros no Projuris ADV...")
 
                     pagina = 0
                     total_coletado_filtro = 0
@@ -632,6 +723,7 @@ if iniciar_extracao:
 
                         try:
                             data = resposta.json()
+
                         except ValueError as erro:
                             raise RuntimeError(
                                 f"A página {pagina} retornou "
@@ -656,15 +748,13 @@ if iniciar_extracao:
 
                         if total_registros_filtro is not None:
                             st.write(
-                                f"📥 {filtro_atual}: "
-                                f"{total_coletado_filtro}/"
+                                f"📥 {total_coletado_filtro} de "
                                 f"{total_registros_filtro} "
                                 "registros coletados."
                             )
                         else:
                             st.write(
-                                f"📥 {filtro_atual}: "
-                                f"{total_coletado_filtro} "
+                                f"📥 {total_coletado_filtro} "
                                 "registros coletados."
                             )
 
@@ -686,9 +776,11 @@ if iniciar_extracao:
                         label="⚠️ Nenhum registro retornado.",
                         state="complete",
                     )
+
                     st.warning(
                         "Nenhum registro foi retornado pela API."
                     )
+
                     st.stop()
 
                 processos_filtrados = []
@@ -731,19 +823,18 @@ if iniciar_extracao:
                         label="⚠️ Nenhum processo encontrado.",
                         state="complete",
                     )
+
                     st.warning(
                         "Nenhum processo encontrado com os "
                         "filtros selecionados."
                     )
+
                     st.stop()
 
-                total_processos = len(
-                    processos_filtrados
-                )
+                total_processos = len(processos_filtrados)
 
                 st.write(
-                    f"🔍 {total_processos} processos únicos "
-                    "encontrados."
+                    f"🔍 {total_processos} processos únicos encontrados."
                 )
 
                 if retomar_checkpoint:
@@ -770,17 +861,20 @@ if iniciar_extracao:
                 if quantidade_recuperada > 0:
                     st.info(
                         f"♻️ {quantidade_recuperada} resultados "
-                        "recuperados do checkpoint."
+                        "recuperados da execução anterior."
                     )
 
-                total_pendentes = len(
-                    processos_pendentes
-                )
+                total_pendentes = len(processos_pendentes)
 
                 st.write(
-                    f"⚡ Consultando {total_pendentes} processos "
-                    f"com até {quantidade_threads} consultas "
-                    "simultâneas no Broly."
+                    f"⚡ Buscando os IDs de demanda de "
+                    f"{total_pendentes} processos."
+                )
+
+                aviso_consultas = st.info(
+                    "🔄 Até 20 consultas em andamento no Broly. "
+                    "A contagem pode ficar alguns segundos parada "
+                    "enquanto as respostas são processadas."
                 )
 
                 progress_bar = st.progress(
@@ -798,9 +892,8 @@ if iniciar_extracao:
 
                 if processos_pendentes:
                     with ThreadPoolExecutor(
-                        max_workers=quantidade_threads
+                        max_workers=MAX_THREADS
                     ) as executor:
-
                         futures = {
                             executor.submit(
                                 consultar_processo,
@@ -815,10 +908,15 @@ if iniciar_extracao:
 
                             try:
                                 resultado = future.result()
+
                             except Exception as erro:
                                 resultado = {
-                                    "Processo": processo_original["Processo"],
-                                    "Tribunal": processo_original["Tribunal"],
+                                    "Processo": processo_original[
+                                        "Processo"
+                                    ],
+                                    "Tribunal": processo_original[
+                                        "Tribunal"
+                                    ],
                                     "ID Central": (
                                         processo_original["id_central"]
                                         or "N/A"
@@ -831,10 +929,7 @@ if iniciar_extracao:
                                     "Link": "N/A",
                                 }
 
-                            resultados_finais.append(
-                                resultado
-                            )
-
+                            resultados_finais.append(resultado)
                             concluidos_nesta_execucao += 1
 
                             total_concluido = (
@@ -844,8 +939,7 @@ if iniciar_extracao:
 
                             progress_bar.progress(
                                 min(
-                                    total_concluido
-                                    / total_processos,
+                                    total_concluido / total_processos,
                                     1.0,
                                 )
                             )
@@ -869,8 +963,8 @@ if iniciar_extracao:
                             segundos = int(estimativa % 60)
 
                             texto_progresso.write(
-                                f"Consultados {total_concluido}/"
-                                f"{total_processos} processos."
+                                f"✅ {total_concluido} de "
+                                f"{total_processos} processos consultados."
                             )
 
                             texto_estimativa.caption(
@@ -894,12 +988,11 @@ if iniciar_extracao:
                     caminho_checkpoint,
                 )
 
+                aviso_consultas.empty()
                 texto_progresso.empty()
                 texto_estimativa.empty()
 
-                df_final = pd.DataFrame(
-                    resultados_finais
-                )
+                df_final = pd.DataFrame(resultados_finais)
 
                 df_final = df_final.drop_duplicates(
                     subset=["Processo"],
@@ -964,11 +1057,18 @@ if iniciar_extracao:
 
                 st.success(
                     f"Extração concluída: "
-                    f"{len(df_final)} processos, "
-                    f"{total_sucesso} IDs encontrados, "
-                    f"{total_sem_sucesso} registros sem sucesso "
-                    f"e {quantidade_tribunais} planilhas geradas."
+                    f"{len(df_final)} processos consultados, "
+                    f"{total_sucesso} IDs de demanda encontrados, "
+                    f"{total_sem_sucesso} registros sem sucesso e "
+                    f"{quantidade_tribunais} planilhas geradas."
                 )
+
+                if total_sem_sucesso > 0:
+                    st.warning(
+                        "Alguns processos não retornaram um ID de "
+                        "demanda. Consulte a coluna 'Situação' "
+                        "nas planilhas."
+                    )
 
                 st.download_button(
                     label="📥 Baixar planilhas por tribunal",
@@ -1001,5 +1101,6 @@ if iniciar_extracao:
                 st.error(f"Erro: {erro}")
 
                 st.info(
-                    "Caso existam resultados já processados, eles foram preservados no checkpoint."
+                    "Caso existam resultados já processados, "
+                    "eles foram preservados para uma nova tentativa."
                 )
