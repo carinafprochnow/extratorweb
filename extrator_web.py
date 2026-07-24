@@ -1,34 +1,45 @@
-import streamlit as st
-import requests
-import pandas as pd
+import hashlib
+import os
+import re
+import threading
 import time
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
+
+import pandas as pd
+import requests
+import streamlit as st
+
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
 # ============================================================
-# CONFIGURAÇÕES
+# CONFIGURAÇÕES GERAIS
 # ============================================================
 
-URL_API_PROJURIS = (
-    "https://api.projurisadv.com.br/adv-service/consulta/central-captura-processo"
-)
-
-URL_API_ACOMPANHAMENTO = (
-    "https://broly.sajadv.com.br/api/acompanhamento"
-)
+URL_API_PROJURIS = "https://api.projurisadv.com.br/adv-service/consulta/central-captura-processo"
+URL_API_ACOMPANHAMENTO = "https://broly.sajadv.com.br/api/acompanhamento"
 
 QUANTIDADE_POR_PAGINA = 100
 
 TIMEOUT_CONEXAO = 15
 TIMEOUT_LEITURA_PROJURIS = 120
 TIMEOUT_LEITURA_ACOMPANHAMENTO = 60
+
 MAX_TENTATIVAS_PAGINA = 5
 MAX_TENTATIVAS_DEMANDA = 4
+
+# Quantos processos serão consultados simultaneamente.
+# Recomendo começar com 10.
+MAX_THREADS = 10
+
+# Salva um checkpoint a cada 50 resultados concluídos.
+INTERVALO_CHECKPOINT = 50
+
+# Pequena pausa entre páginas da API principal.
 PAUSA_ENTRE_PAGINAS = 0.5
-PAUSA_ENTRE_DEMANDAS = 0.1
 
 
 # ============================================================
@@ -38,14 +49,12 @@ PAUSA_ENTRE_DEMANDAS = 0.1
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
 except KeyError:
-    st.error(
-        "Erro: TOKEN_FORNECEDOR não configurado nos Secrets."
-    )
+    st.error("Erro: TOKEN_FORNECEDOR não configurado nos Secrets.")
     st.stop()
 
 
 # ============================================================
-# MAPAS DE DADOS
+# MAPAS DE DADOS ORIGINAIS
 # ============================================================
 
 MAPA_FILTROS = {
@@ -63,7 +72,6 @@ MAPA_CNJ = {
     "TRF4": ".4.04.",
     "TRF5": ".4.05.",
     "TRF6": ".4.06.",
-
     "TRT1": ".5.01.",
     "TRT2": ".5.02.",
     "TRT3": ".5.03.",
@@ -88,7 +96,6 @@ MAPA_CNJ = {
     "TRT22": ".5.22.",
     "TRT23": ".5.23.",
     "TRT24": ".5.24.",
-
     "TJAC": ".8.01.",
     "TJAL": ".8.02.",
     "TJAM": ".8.04.",
@@ -148,15 +155,16 @@ DIC_TRIBUNAIS = {
 
 
 # ============================================================
-# FUNÇÕES
+# SESSÕES HTTP
 # ============================================================
+
+_thread_local = threading.local()
+
 
 def criar_sessao_http():
     """
-    Cria uma sessão HTTP reutilizável.
-
-    A sessão reaproveita conexões e aplica retentativas para
-    determinados erros HTTP temporários.
+    Cria uma sessão HTTP com reaproveitamento de conexão e
+    retentativas para erros temporários.
     """
 
     estrategia_retry = Retry(
@@ -165,24 +173,15 @@ def criar_sessao_http():
         read=0,
         status=3,
         backoff_factor=1,
-        status_forcelist=[
-            429,
-            500,
-            502,
-            503,
-            504,
-        ],
-        allowed_methods=[
-            "GET",
-            "POST",
-        ],
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
         raise_on_status=False,
     )
 
     adaptador = HTTPAdapter(
         max_retries=estrategia_retry,
-        pool_connections=10,
-        pool_maxsize=10,
+        pool_connections=MAX_THREADS + 5,
+        pool_maxsize=MAX_THREADS + 5,
     )
 
     sessao = requests.Session()
@@ -191,6 +190,149 @@ def criar_sessao_http():
 
     return sessao
 
+
+def obter_sessao_thread():
+    """
+    Cada thread recebe sua própria sessão requests.
+
+    Isso evita compartilhar a mesma Session entre várias threads.
+    """
+
+    if not hasattr(_thread_local, "sessao"):
+        _thread_local.sessao = criar_sessao_http()
+
+    return _thread_local.sessao
+
+
+# ============================================================
+# FUNÇÕES DE CHECKPOINT
+# ============================================================
+
+def limpar_texto_nome_arquivo(valor):
+    """
+    Remove caracteres inadequados para nomes de arquivos.
+    """
+
+    valor = str(valor).strip()
+    valor = re.sub(r"[^a-zA-Z0-9_-]+", "_", valor)
+
+    return valor[:80] or "sem_valor"
+
+
+def gerar_caminho_checkpoint(
+    token_usuario,
+    cd_arrendatario,
+    status_usuario,
+    ambito,
+    tribunal_sigla,
+):
+    """
+    Cria um nome de checkpoint específico para a combinação
+    atual de usuário, arrendatário e filtros.
+
+    O token não é gravado no nome: apenas um hash.
+    """
+
+    identificador = "|".join(
+        [
+            token_usuario,
+            cd_arrendatario,
+            status_usuario,
+            ambito,
+            tribunal_sigla,
+        ]
+    )
+
+    hash_execucao = hashlib.sha256(
+        identificador.encode("utf-8")
+    ).hexdigest()[:16]
+
+    arrendatario_seguro = limpar_texto_nome_arquivo(
+        cd_arrendatario
+    )
+
+    return os.path.join(
+        "/tmp",
+        f"checkpoint_projuris_{arrendatario_seguro}_{hash_execucao}.csv",
+    )
+
+
+def salvar_checkpoint(resultados, caminho):
+    """
+    Salva os resultados já concluídos em um arquivo CSV.
+    """
+
+    if not resultados:
+        return
+
+    df_checkpoint = pd.DataFrame(resultados)
+
+    df_checkpoint = df_checkpoint.drop_duplicates(
+        subset=["Processo"],
+        keep="last",
+    )
+
+    caminho_temporario = f"{caminho}.tmp"
+
+    df_checkpoint.to_csv(
+        caminho_temporario,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    os.replace(
+        caminho_temporario,
+        caminho,
+    )
+
+
+def carregar_checkpoint(caminho):
+    """
+    Carrega resultados salvos anteriormente.
+    """
+
+    if not os.path.exists(caminho):
+        return []
+
+    try:
+        df_checkpoint = pd.read_csv(
+            caminho,
+            dtype=str,
+            encoding="utf-8-sig",
+        )
+
+        colunas_esperadas = {
+            "Processo",
+            "Tribunal",
+            "ID Central",
+            "ID Demanda",
+            "Situação",
+            "Link",
+        }
+
+        if not colunas_esperadas.issubset(
+            set(df_checkpoint.columns)
+        ):
+            return []
+
+        df_checkpoint = df_checkpoint.fillna("N/A")
+
+        df_checkpoint = df_checkpoint.drop_duplicates(
+            subset=["Processo"],
+            keep="last",
+        )
+
+        return df_checkpoint.to_dict(
+            orient="records"
+        )
+
+    except Exception:
+        return []
+
+
+# ============================================================
+# CONSULTA DA API PRINCIPAL
+# ============================================================
 
 def consultar_pagina_projuris(
     sessao,
@@ -201,8 +343,8 @@ def consultar_pagina_projuris(
     """
     Consulta uma página da Central de Captura.
 
-    Realiza até MAX_TENTATIVAS_PAGINA tentativas em caso de
-    timeout ou erro de conexão.
+    Em caso de timeout ou erro de conexão, tenta novamente
+    antes de encerrar a extração.
     """
 
     payload = {
@@ -249,23 +391,18 @@ def consultar_pagina_projuris(
             )
 
         except requests.exceptions.ConnectionError as erro:
-            ultimo_erro = (
-                f"Erro de conexão: {erro}"
-            )
+            ultimo_erro = f"Erro de conexão: {erro}"
 
         except requests.exceptions.RequestException as erro:
-            ultimo_erro = (
-                f"Erro na requisição: {erro}"
-            )
+            ultimo_erro = f"Erro na requisição: {erro}"
 
         if tentativa < MAX_TENTATIVAS_PAGINA:
             tempo_espera = tentativa * 5
 
             st.warning(
                 f"⏳ Página {pagina}: tentativa "
-                f"{tentativa}/{MAX_TENTATIVAS_PAGINA} "
-                f"falhou. Nova tentativa em "
-                f"{tempo_espera} segundos."
+                f"{tentativa}/{MAX_TENTATIVAS_PAGINA} falhou. "
+                f"Nova tentativa em {tempo_espera} segundos."
             )
 
             time.sleep(tempo_espera)
@@ -277,9 +414,13 @@ def consultar_pagina_projuris(
     )
 
 
+# ============================================================
+# EXTRAÇÃO E FILTRAGEM DOS PROCESSOS
+# ============================================================
+
 def extrair_numero_processo(item):
     """
-    Obtém o número do processo a partir do item retornado.
+    Obtém o número do processo exatamente como no script original.
     """
 
     valor_numero = item.get("paramentroCaptura")
@@ -307,8 +448,8 @@ def processo_corresponde_ao_filtro(
     tribunal_sigla,
 ):
     """
-    Verifica se o processo corresponde ao âmbito e tribunal
-    selecionados.
+    Mantém a mesma lógica original de separação por âmbito
+    e tribunal.
     """
 
     if ambito == "TODOS":
@@ -338,23 +479,49 @@ def processo_corresponde_ao_filtro(
     return codigo_especifico in numero_processo
 
 
-def buscar_id_demanda(
-    sessao,
+# ============================================================
+# CONSULTA DOS IDS DE DEMANDA
+# ============================================================
+
+def montar_link_seguro(
     cd_arrendatario,
     id_central,
 ):
     """
-    Busca o ID da demanda na API de acompanhamento.
-
-    Retorna também uma situação para facilitar a identificação
-    de registros que falharam.
+    Monta um link informativo sem expor o TOKEN_FORNECEDOR
+    na planilha.
     """
+
+    return (
+        f"{URL_API_ACOMPANHAMENTO}"
+        f"?token=***"
+        f"&cdArrendatario={cd_arrendatario}"
+        f"&cdCentralCapturaProcesso={id_central}"
+    )
+
+
+def buscar_id_demanda(
+    cd_arrendatario,
+    id_central,
+):
+    """
+    Busca o ID da demanda.
+
+    Essa função é executada paralelamente pelas threads.
+    """
+
+    sessao = obter_sessao_thread()
 
     parametros = {
         "token": TOKEN_FORNECEDOR,
         "cdArrendatario": cd_arrendatario,
         "cdCentralCapturaProcesso": id_central,
     }
+
+    link_seguro = montar_link_seguro(
+        cd_arrendatario,
+        id_central,
+    )
 
     ultimo_erro = None
 
@@ -379,22 +546,22 @@ def buscar_id_demanda(
                     return (
                         "N/A",
                         "RESPOSTA JSON INVÁLIDA",
-                        resposta.url,
+                        link_seguro,
                     )
 
                 id_demanda = dados.get("idDemanda")
 
                 if id_demanda:
                     return (
-                        id_demanda,
+                        str(id_demanda),
                         "SUCESSO",
-                        resposta.url,
+                        link_seguro,
                     )
 
                 return (
                     "N/A",
                     "ID NÃO ENCONTRADO",
-                    resposta.url,
+                    link_seguro,
                 )
 
             if resposta.status_code in [
@@ -405,7 +572,7 @@ def buscar_id_demanda(
                 504,
             ]:
                 ultimo_erro = (
-                    f"Erro HTTP {resposta.status_code}"
+                    f"ERRO HTTP {resposta.status_code}"
                 )
 
                 if tentativa < MAX_TENTATIVAS_DEMANDA:
@@ -416,7 +583,7 @@ def buscar_id_demanda(
             return (
                 "N/A",
                 f"ERRO HTTP {resposta.status_code}",
-                resposta.url,
+                link_seguro,
             )
 
         except requests.exceptions.ReadTimeout:
@@ -425,8 +592,10 @@ def buscar_id_demanda(
         except requests.exceptions.ConnectTimeout:
             ultimo_erro = "TIMEOUT DE CONEXÃO"
 
-        except requests.exceptions.ConnectionError:
-            ultimo_erro = "ERRO DE CONEXÃO"
+        except requests.exceptions.ConnectionError as erro:
+            ultimo_erro = (
+                f"ERRO DE CONEXÃO: {erro}"
+            )
 
         except requests.exceptions.RequestException as erro:
             ultimo_erro = (
@@ -437,17 +606,126 @@ def buscar_id_demanda(
             tempo_espera = tentativa * 2
             time.sleep(tempo_espera)
 
-    requisicao_preparada = requests.Request(
-        "GET",
-        URL_API_ACOMPANHAMENTO,
-        params=parametros,
-    ).prepare()
-
     return (
         "N/A",
         ultimo_erro or "ERRO DESCONHECIDO",
-        requisicao_preparada.url,
+        link_seguro,
     )
+
+
+def consultar_processo(
+    processo,
+    cd_arrendatario,
+):
+    """
+    Consulta um processo e devolve o registro completo
+    que será incluído na planilha.
+    """
+
+    id_central = processo.get("id_central")
+
+    if not id_central:
+        return {
+            "Processo": processo["Processo"],
+            "Tribunal": processo["Tribunal"],
+            "ID Central": "N/A",
+            "ID Demanda": "N/A",
+            "Situação": "ID CENTRAL NÃO ENCONTRADO",
+            "Link": "N/A",
+        }
+
+    try:
+        (
+            id_demanda,
+            situacao,
+            link_consulta,
+        ) = buscar_id_demanda(
+            cd_arrendatario=cd_arrendatario,
+            id_central=id_central,
+        )
+
+        return {
+            "Processo": processo["Processo"],
+            "Tribunal": processo["Tribunal"],
+            "ID Central": str(id_central),
+            "ID Demanda": id_demanda,
+            "Situação": situacao,
+            "Link": link_consulta,
+        }
+
+    except Exception as erro:
+        return {
+            "Processo": processo["Processo"],
+            "Tribunal": processo["Tribunal"],
+            "ID Central": str(id_central),
+            "ID Demanda": "N/A",
+            "Situação": f"ERRO INESPERADO: {erro}",
+            "Link": montar_link_seguro(
+                cd_arrendatario,
+                id_central,
+            ),
+        }
+
+
+# ============================================================
+# GERAÇÃO DO EXCEL
+# ============================================================
+
+def gerar_excel(df_final):
+    """
+    Gera a planilha Excel em memória.
+    """
+
+    output = BytesIO()
+
+    with pd.ExcelWriter(
+        output,
+        engine="xlsxwriter",
+    ) as writer:
+        df_final.to_excel(
+            writer,
+            index=False,
+            sheet_name="Resultados",
+        )
+
+        workbook = writer.book
+        worksheet = writer.sheets["Resultados"]
+
+        formato_cabecalho = workbook.add_format(
+            {
+                "bold": True,
+                "border": 1,
+            }
+        )
+
+        for numero_coluna, nome_coluna in enumerate(
+            df_final.columns
+        ):
+            worksheet.write(
+                0,
+                numero_coluna,
+                nome_coluna,
+                formato_cabecalho,
+            )
+
+        worksheet.set_column("A:A", 28)
+        worksheet.set_column("B:B", 18)
+        worksheet.set_column("C:D", 18)
+        worksheet.set_column("E:E", 35)
+        worksheet.set_column("F:F", 100)
+
+        worksheet.autofilter(
+            0,
+            0,
+            len(df_final),
+            len(df_final.columns) - 1,
+        )
+
+        worksheet.freeze_panes(1, 0)
+
+    output.seek(0)
+
+    return output
 
 
 # ============================================================
@@ -459,9 +737,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title(
-    "📂 Extração de Capturas - Projuris ADV"
-)
+st.title("📂 Extração de Capturas - Projuris ADV")
 
 with st.sidebar:
     st.header("Configurações")
@@ -495,12 +771,38 @@ with st.sidebar:
         DIC_TRIBUNAIS[ambito],
     )
 
+    st.divider()
+    st.header("Desempenho")
+
+    quantidade_threads = st.slider(
+        "Consultas simultâneas",
+        min_value=1,
+        max_value=20,
+        value=MAX_THREADS,
+        help=(
+            "Recomenda-se usar 10. Valores muito altos podem "
+            "sobrecarregar a API ou causar erro 429."
+        ),
+    )
+
+    retomar_checkpoint = st.checkbox(
+        "Retomar extração interrompida",
+        value=True,
+        help=(
+            "Caso exista um checkpoint desta mesma consulta, "
+            "os processos já concluídos não serão consultados novamente."
+        ),
+    )
+
 
 # ============================================================
 # EXECUÇÃO
 # ============================================================
 
-if st.button("🚀 Iniciar Extração"):
+if st.button(
+    "🚀 Iniciar Extração",
+    type="primary",
+):
     if not token_user_raw:
         st.error("Insira o Token.")
 
@@ -512,19 +814,17 @@ if st.button("🚀 Iniciar Extração"):
             "Extraindo processos...",
             expanded=True,
         ) as status_box:
+            caminho_checkpoint = None
+
             try:
-                sessao = criar_sessao_http()
+                sessao_principal = criar_sessao_http()
 
                 token_limpo = token_user_raw.strip()
 
-                if token_limpo.lower().startswith(
-                    "bearer "
-                ):
+                if token_limpo.lower().startswith("bearer "):
                     token_final = token_limpo
                 else:
-                    token_final = (
-                        f"Bearer {token_limpo}"
-                    )
+                    token_final = f"Bearer {token_limpo}"
 
                 headers = {
                     "Authorization": token_final,
@@ -532,6 +832,14 @@ if st.button("🚀 Iniciar Extração"):
                     "Accept": "application/json",
                     "User-Agent": "Mozilla/5.0",
                 }
+
+                caminho_checkpoint = gerar_caminho_checkpoint(
+                    token_usuario=token_limpo,
+                    cd_arrendatario=cd_arrendatario,
+                    status_usuario=status_usuario,
+                    ambito=ambito,
+                    tribunal_sigla=tribunal_sigla,
+                )
 
                 filtro_api = MAPA_FILTROS.get(
                     status_usuario
@@ -550,12 +858,12 @@ if st.button("🚀 Iniciar Extração"):
                 dados_brutos = []
 
                 # ------------------------------------------------
-                # COLETA PAGINADA
+                # 1. COLETA PAGINADA DOS PROCESSOS
                 # ------------------------------------------------
 
                 for filtro_atual in filtros_api_lista:
                     st.write(
-                        f"🛰️ Consultando "
+                        f"🛰️ Consultando filtro "
                         f"{filtro_atual}..."
                     )
 
@@ -565,7 +873,7 @@ if st.button("🚀 Iniciar Extração"):
 
                     while True:
                         resposta = consultar_pagina_projuris(
-                            sessao=sessao,
+                            sessao=sessao_principal,
                             headers=headers,
                             filtro=filtro_atual,
                             pagina=pagina,
@@ -573,31 +881,26 @@ if st.button("🚀 Iniciar Extração"):
 
                         if resposta.status_code != 200:
                             if resposta.status_code == 412:
-                                st.error(
+                                raise RuntimeError(
                                     "Erro 412: verifique o "
                                     "Arrendatário ou o Token."
                                 )
-                            else:
-                                st.error(
-                                    f"Erro HTTP "
-                                    f"{resposta.status_code} "
-                                    f"na página {pagina}."
-                                )
 
-                                st.code(
-                                    resposta.text[:1000]
-                                )
-
-                            break
+                            raise RuntimeError(
+                                f"Erro HTTP "
+                                f"{resposta.status_code} "
+                                f"na página {pagina}. "
+                                f"Resposta: "
+                                f"{resposta.text[:500]}"
+                            )
 
                         try:
                             data = resposta.json()
-                        except ValueError:
-                            st.error(
+                        except ValueError as erro:
+                            raise RuntimeError(
                                 f"A página {pagina} retornou "
-                                "uma resposta inválida."
-                            )
-                            break
+                                "uma resposta JSON inválida."
+                            ) from erro
 
                         itens = data.get(
                             "centralCapturaProcessoConsultaResultadoWs",
@@ -606,32 +909,30 @@ if st.button("🚀 Iniciar Extração"):
 
                         if not itens:
                             st.write(
-                                f"Página {pagina} sem "
-                                "novos registros."
+                                f"Página {pagina} sem novos "
+                                "registros."
                             )
                             break
 
                         dados_brutos.extend(itens)
 
-                        total_coletado_filtro += len(
-                            itens
-                        )
+                        total_coletado_filtro += len(itens)
 
                         total_registros_filtro = data.get(
                             "totalRegistros",
                             total_registros_filtro,
                         )
 
-                        if total_registros_filtro:
+                        if total_registros_filtro is not None:
                             st.write(
-                                f"📥 Filtro {filtro_atual}: "
+                                f"📥 {filtro_atual}: "
                                 f"{total_coletado_filtro}/"
                                 f"{total_registros_filtro} "
                                 "registros coletados."
                             )
                         else:
                             st.write(
-                                f"📥 Filtro {filtro_atual}: "
+                                f"📥 {filtro_atual}: "
                                 f"{total_coletado_filtro} "
                                 "registros coletados."
                             )
@@ -650,28 +951,22 @@ if st.button("🚀 Iniciar Extração"):
                             break
 
                         pagina += 1
-
-                        time.sleep(
-                            PAUSA_ENTRE_PAGINAS
-                        )
+                        time.sleep(PAUSA_ENTRE_PAGINAS)
 
                 if not dados_brutos:
                     status_box.update(
-                        label=(
-                            "⚠️ Nenhum registro retornado."
-                        ),
+                        label="⚠️ Nenhum registro retornado.",
                         state="complete",
                     )
 
                     st.warning(
-                        "Nenhum registro foi retornado "
-                        "pela API."
+                        "Nenhum registro foi retornado pela API."
                     )
 
                     st.stop()
 
                 # ------------------------------------------------
-                # FILTRAGEM DOS PROCESSOS
+                # 2. FILTRAGEM POR ÂMBITO E TRIBUNAL
                 # ------------------------------------------------
 
                 processos_filtrados = []
@@ -681,15 +976,11 @@ if st.button("🚀 Iniciar Extração"):
                         extrair_numero_processo(item)
                     )
 
-                    corresponde = (
-                        processo_corresponde_ao_filtro(
-                            numero_processo=numero_processo,
-                            ambito=ambito,
-                            tribunal_sigla=tribunal_sigla,
-                        )
-                    )
-
-                    if corresponde:
+                    if processo_corresponde_ao_filtro(
+                        numero_processo=numero_processo,
+                        ambito=ambito,
+                        tribunal_sigla=tribunal_sigla,
+                    ):
                         processos_filtrados.append(
                             {
                                 "Processo": numero_processo,
@@ -702,15 +993,15 @@ if st.button("🚀 Iniciar Extração"):
                             }
                         )
 
-                # Remove duplicidade antes da busca das demandas,
-                # evitando chamadas desnecessárias.
+                # Mantém apenas um registro por número de processo,
+                # como no comportamento anterior do drop_duplicates.
                 processos_unicos = {}
 
                 for processo in processos_filtrados:
-                    chave = processo["Processo"]
+                    numero = processo["Processo"]
 
-                    if chave not in processos_unicos:
-                        processos_unicos[chave] = processo
+                    if numero not in processos_unicos:
+                        processos_unicos[numero] = processo
 
                 processos_filtrados = list(
                     processos_unicos.values()
@@ -718,15 +1009,13 @@ if st.button("🚀 Iniciar Extração"):
 
                 if not processos_filtrados:
                     status_box.update(
-                        label=(
-                            "⚠️ Nenhum processo encontrado."
-                        ),
+                        label="⚠️ Nenhum processo encontrado.",
                         state="complete",
                     )
 
                     st.warning(
-                        "Nenhum processo encontrado "
-                        "com os filtros selecionados."
+                        "Nenhum processo encontrado com os "
+                        "filtros selecionados."
                     )
 
                     st.stop()
@@ -736,84 +1025,249 @@ if st.button("🚀 Iniciar Extração"):
                 )
 
                 st.write(
-                    f"🔍 {total_processos} processos "
-                    "filtrados. Buscando IDs de demanda..."
+                    f"🔍 {total_processos} processos únicos "
+                    "encontrados."
                 )
 
                 # ------------------------------------------------
-                # BUSCA DOS IDS DE DEMANDA
+                # 3. CARREGAMENTO DO CHECKPOINT
                 # ------------------------------------------------
 
                 resultados_finais = []
 
-                progress_bar = st.progress(0)
-                texto_progresso = st.empty()
-
-                for indice, processo in enumerate(
-                    processos_filtrados,
-                    start=1,
-                ):
-                    texto_progresso.write(
-                        f"Consultando processo "
-                        f"{indice} de {total_processos}: "
-                        f"{processo['Processo']}"
-                    )
-
-                    id_central = processo.get(
-                        "id_central"
-                    )
-
-                    if not id_central:
-                        id_demanda = "N/A"
-                        situacao = (
-                            "ID CENTRAL NÃO ENCONTRADO"
+                if retomar_checkpoint:
+                    resultados_finais = (
+                        carregar_checkpoint(
+                            caminho_checkpoint
                         )
-                        link_consulta = "N/A"
-
-                    else:
-                        (
-                            id_demanda,
-                            situacao,
-                            link_consulta,
-                        ) = buscar_id_demanda(
-                            sessao=sessao,
-                            cd_arrendatario=(
-                                cd_arrendatario
-                            ),
-                            id_central=id_central,
-                        )
-
-                    resultados_finais.append(
-                        {
-                            "Processo": (
-                                processo["Processo"]
-                            ),
-                            "Tribunal": (
-                                processo["Tribunal"]
-                            ),
-                            "ID Central": id_central,
-                            "ID Demanda": id_demanda,
-                            "Situação": situacao,
-                            "Link": link_consulta,
-                        }
                     )
 
-                    progress_bar.progress(
-                        indice / total_processos
+                processos_ja_concluidos = {
+                    str(resultado["Processo"])
+                    for resultado in resultados_finais
+                }
+
+                processos_pendentes = [
+                    processo
+                    for processo in processos_filtrados
+                    if str(processo["Processo"])
+                    not in processos_ja_concluidos
+                ]
+
+                quantidade_recuperada = len(
+                    processos_ja_concluidos
+                )
+
+                if quantidade_recuperada > 0:
+                    st.info(
+                        f"♻️ {quantidade_recuperada} resultados "
+                        "foram recuperados do checkpoint."
                     )
 
-                    time.sleep(
-                        PAUSA_ENTRE_DEMANDAS
+                total_pendentes = len(
+                    processos_pendentes
+                )
+
+                if total_pendentes == 0:
+                    st.success(
+                        "Todos os processos já estavam "
+                        "concluídos no checkpoint."
                     )
 
-                texto_progresso.empty()
+                else:
+                    st.write(
+                        f"⚡ Consultando {total_pendentes} "
+                        f"processos com até "
+                        f"{quantidade_threads} consultas "
+                        "simultâneas."
+                    )
 
                 # ------------------------------------------------
-                # GERAÇÃO DA PLANILHA
+                # 4. CONSULTAS PARALELAS DOS IDS DE DEMANDA
+                # ------------------------------------------------
+
+                progress_bar = st.progress(
+                    min(
+                        quantidade_recuperada / total_processos,
+                        1.0,
+                    )
+                )
+
+                texto_progresso = st.empty()
+                texto_estatisticas = st.empty()
+
+                inicio_consultas = time.monotonic()
+                concluidos_nesta_execucao = 0
+
+                if processos_pendentes:
+                    with ThreadPoolExecutor(
+                        max_workers=quantidade_threads
+                    ) as executor:
+                        future_para_processo = {
+                            executor.submit(
+                                consultar_processo,
+                                processo,
+                                cd_arrendatario,
+                            ): processo
+                            for processo in processos_pendentes
+                        }
+
+                        for future in as_completed(
+                            future_para_processo
+                        ):
+                            processo_original = (
+                                future_para_processo[future]
+                            )
+
+                            try:
+                                resultado = future.result()
+                            except Exception as erro:
+                                resultado = {
+                                    "Processo": (
+                                        processo_original[
+                                            "Processo"
+                                        ]
+                                    ),
+                                    "Tribunal": (
+                                        processo_original[
+                                            "Tribunal"
+                                        ]
+                                    ),
+                                    "ID Central": (
+                                        processo_original[
+                                            "id_central"
+                                        ]
+                                        or "N/A"
+                                    ),
+                                    "ID Demanda": "N/A",
+                                    "Situação": (
+                                        "ERRO INESPERADO NA "
+                                        f"THREAD: {erro}"
+                                    ),
+                                    "Link": "N/A",
+                                }
+
+                            resultados_finais.append(
+                                resultado
+                            )
+
+                            concluidos_nesta_execucao += 1
+
+                            total_concluido = (
+                                quantidade_recuperada
+                                + concluidos_nesta_execucao
+                            )
+
+                            percentual = min(
+                                total_concluido
+                                / total_processos,
+                                1.0,
+                            )
+
+                            progress_bar.progress(
+                                percentual
+                            )
+
+                            tempo_decorrido = (
+                                time.monotonic()
+                                - inicio_consultas
+                            )
+
+                            media_por_resultado = (
+                                tempo_decorrido
+                                / concluidos_nesta_execucao
+                            )
+
+                            restantes = (
+                                total_pendentes
+                                - concluidos_nesta_execucao
+                            )
+
+                            estimativa_segundos = (
+                                media_por_resultado
+                                * restantes
+                            )
+
+                            minutos_estimados = int(
+                                estimativa_segundos // 60
+                            )
+
+                            segundos_estimados = int(
+                                estimativa_segundos % 60
+                            )
+
+                            texto_progresso.write(
+                                f"Consultados "
+                                f"{total_concluido}/"
+                                f"{total_processos} processos."
+                            )
+
+                            texto_estatisticas.caption(
+                                f"Restantes: {restantes} | "
+                                f"Estimativa aproximada: "
+                                f"{minutos_estimados} min "
+                                f"{segundos_estimados} s"
+                            )
+
+                            if (
+                                concluidos_nesta_execucao
+                                % INTERVALO_CHECKPOINT
+                                == 0
+                            ):
+                                salvar_checkpoint(
+                                    resultados_finais,
+                                    caminho_checkpoint,
+                                )
+
+                                st.write(
+                                    f"💾 Checkpoint salvo com "
+                                    f"{total_concluido} "
+                                    "resultados."
+                                )
+
+                # Salva o estado final antes de gerar a planilha.
+                salvar_checkpoint(
+                    resultados_finais,
+                    caminho_checkpoint,
+                )
+
+                texto_progresso.empty()
+                texto_estatisticas.empty()
+
+                # ------------------------------------------------
+                # 5. ORGANIZAÇÃO DOS RESULTADOS
                 # ------------------------------------------------
 
                 df_final = pd.DataFrame(
                     resultados_finais
+                )
+
+                df_final = df_final.drop_duplicates(
+                    subset=["Processo"],
+                    keep="last",
+                )
+
+                # Mantém a ordem original dos processos.
+                ordem_processos = {
+                    str(processo["Processo"]): indice
+                    for indice, processo in enumerate(
+                        processos_filtrados
+                    )
+                }
+
+                df_final["_ordem"] = (
+                    df_final["Processo"]
+                    .astype(str)
+                    .map(ordem_processos)
+                )
+
+                df_final = (
+                    df_final.sort_values(
+                        by="_ordem",
+                        na_position="last",
+                    )
+                    .drop(columns=["_ordem"])
+                    .reset_index(drop=True)
                 )
 
                 total_sucesso = (
@@ -822,80 +1276,18 @@ if st.button("🚀 Iniciar Extração"):
                     .sum()
                 )
 
-                total_falhas = (
-                    len(df_final) - total_sucesso
+                total_sem_sucesso = (
+                    len(df_final)
+                    - total_sucesso
                 )
 
-                output = BytesIO()
+                # ------------------------------------------------
+                # 6. GERAÇÃO DA PLANILHA
+                # ------------------------------------------------
 
-                with pd.ExcelWriter(
-                    output,
-                    engine="xlsxwriter",
-                ) as writer:
-                    df_final.to_excel(
-                        writer,
-                        index=False,
-                        sheet_name="Resultados",
-                    )
-
-                    workbook = writer.book
-                    worksheet = writer.sheets[
-                        "Resultados"
-                    ]
-
-                    formato_cabecalho = (
-                        workbook.add_format(
-                            {
-                                "bold": True,
-                                "border": 1,
-                            }
-                        )
-                    )
-
-                    for coluna_numero, nome_coluna in enumerate(
-                        df_final.columns
-                    ):
-                        worksheet.write(
-                            0,
-                            coluna_numero,
-                            nome_coluna,
-                            formato_cabecalho,
-                        )
-
-                    worksheet.set_column(
-                        "A:A",
-                        28,
-                    )
-                    worksheet.set_column(
-                        "B:B",
-                        18,
-                    )
-                    worksheet.set_column(
-                        "C:D",
-                        18,
-                    )
-                    worksheet.set_column(
-                        "E:E",
-                        28,
-                    )
-                    worksheet.set_column(
-                        "F:F",
-                        100,
-                    )
-
-                    worksheet.autofilter(
-                        0,
-                        0,
-                        len(df_final),
-                        len(df_final.columns) - 1,
-                    )
-
-                    worksheet.freeze_panes(
-                        1,
-                        0,
-                    )
-
-                output.seek(0)
+                output = gerar_excel(
+                    df_final
+                )
 
                 nome_arquivo = (
                     f"{status_usuario} - "
@@ -910,19 +1302,17 @@ if st.button("🚀 Iniciar Extração"):
                 )
 
                 st.success(
-                    f"Extração concluída. "
+                    f"Extração concluída: "
                     f"{len(df_final)} processos consultados, "
-                    f"{total_sucesso} IDs encontrados e "
-                    f"{total_falhas} registros sem sucesso."
+                    f"{total_sucesso} IDs de demanda encontrados "
+                    f"e {total_sem_sucesso} registros sem sucesso."
                 )
 
-                if total_falhas > 0:
+                if total_sem_sucesso > 0:
                     st.warning(
-                        "Alguns registros não retornaram um "
-                        "ID de demanda. Consulte a coluna "
-                        "'Situação' da planilha para identificar "
-                        "timeouts, erros HTTP ou IDs não "
-                        "encontrados."
+                        "Alguns registros não retornaram um ID "
+                        "de demanda. Consulte a coluna "
+                        "'Situação' da planilha."
                     )
 
                 st.download_button(
@@ -930,17 +1320,43 @@ if st.button("🚀 Iniciar Extração"):
                     data=output.getvalue(),
                     file_name=nome_arquivo,
                     mime=(
-                        "application/vnd.openxmlformats-"
-                        "officedocument.spreadsheetml.sheet"
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
                     ),
                 )
 
+                # Como a extração chegou ao fim e o Excel foi criado,
+                # o checkpoint não é mais necessário.
+                if os.path.exists(caminho_checkpoint):
+                    try:
+                        os.remove(caminho_checkpoint)
+                    except OSError:
+                        pass
+
             except Exception as erro:
+                # Tenta preservar tudo o que já foi processado.
+                if (
+                    caminho_checkpoint
+                    and "resultados_finais" in locals()
+                    and resultados_finais
+                ):
+                    try:
+                        salvar_checkpoint(
+                            resultados_finais,
+                            caminho_checkpoint,
+                        )
+                    except Exception:
+                        pass
+
                 status_box.update(
                     label="❌ Erro durante a extração",
                     state="error",
                 )
 
-                st.error(
-                    f"Erro: {erro}"
+                st.error(f"Erro: {erro}")
+
+                st.info(
+                    "Caso já existam resultados processados, "
+                    "eles foram mantidos no checkpoint. Execute "
+                    "novamente com a opção de retomada marcada."
                 )
