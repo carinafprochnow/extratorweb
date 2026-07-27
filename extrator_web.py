@@ -31,7 +31,7 @@ MAX_TENTATIVAS_DEMANDA = 4
 MAX_THREADS = 20
 INTERVALO_CHECKPOINT = 50
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v3"
+VERSAO_CHECKPOINT = "v4"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -501,77 +501,135 @@ def extrair_valor_xml(raiz, nomes_possiveis):
     return "N/A"
 
 
+def extrair_tag_do_texto(texto, tag):
+    """
+    Extrai uma tag diretamente do texto bruto retornado pelo Broly.
+
+    Aceita tags simples e tags com prefixo de namespace, por exemplo:
+    <idDemanda>...</idDemanda>
+    <ns:idDemanda>...</ns:idDemanda>
+    """
+    if not texto:
+        return "N/A"
+
+    padrao = (
+        rf"<(?:[A-Za-z0-9_.-]+:)?{re.escape(tag)}\\b[^>]*>"
+        rf"\\s*(.*?)\\s*"
+        rf"</(?:[A-Za-z0-9_.-]+:)?{re.escape(tag)}\\s*>"
+    )
+
+    correspondencia = re.search(
+        padrao,
+        texto,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    if not correspondencia:
+        return "N/A"
+
+    valor = correspondencia.group(1)
+    valor = re.sub(r"<!\\[CDATA\\[(.*?)\\]\\]>", r"\\1", valor, flags=re.DOTALL)
+    valor = re.sub(r"<[^>]+>", "", valor)
+    valor = valor.strip()
+
+    return valor or "N/A"
+
+
 def interpretar_resposta_broly(resposta):
     """
-    O Broly pode retornar XML/XHTML.
+    Extrai idDemanda, excecao e provedor do XML/XHTML do Broly.
 
-    Esta função extrai:
-    - idDemanda;
-    - excecao;
-    - provedor.
+    A leitura é feita primeiro pelo texto bruto, que é mais tolerante
+    a XML com namespace, cabeçalho, BOM ou pequenas inconsistências.
+    Depois, caso alguma informação não seja localizada, tenta também
+    interpretar a resposta como XML estruturado.
     """
-    conteudo = resposta.content
+    conteudo = resposta.content or b""
 
-    try:
-        raiz = ET.fromstring(conteudo)
+    candidatos_texto = []
 
-    except ET.ParseError:
-        texto = resposta.text or ""
+    if resposta.text:
+        candidatos_texto.append(resposta.text)
 
-        def extrair_por_regex(tag):
-            padrao = (
-                rf"<(?:\w+:)?{tag}\b[^>]*>"
-                r"\s*(.*?)\s*"
-                rf"</(?:\w+:)?{tag}>"
+    for codificacao in (
+        resposta.encoding,
+        "utf-8-sig",
+        "utf-8",
+        "iso-8859-1",
+        "windows-1252",
+    ):
+        if not codificacao:
+            continue
+
+        try:
+            texto_decodificado = conteudo.decode(
+                codificacao,
+                errors="replace",
             )
+        except (LookupError, UnicodeDecodeError):
+            continue
 
-            correspondencia = re.search(
-                padrao,
+        if texto_decodificado not in candidatos_texto:
+            candidatos_texto.append(texto_decodificado)
+
+    id_demanda = "N/A"
+    status = "N/A"
+    fornecedor = "N/A"
+
+    for texto in candidatos_texto:
+        if id_demanda == "N/A":
+            id_demanda = extrair_tag_do_texto(
                 texto,
-                flags=(
-                    re.IGNORECASE
-                    | re.DOTALL
-                ),
+                "idDemanda",
             )
 
-            if not correspondencia:
-                return "N/A"
+        if status == "N/A":
+            status = extrair_tag_do_texto(
+                texto,
+                "excecao",
+            )
 
-            valor = re.sub(
-                r"<[^>]+>",
-                "",
-                correspondencia.group(1),
-            ).strip()
+        if fornecedor == "N/A":
+            fornecedor = extrair_tag_do_texto(
+                texto,
+                "provedor",
+            )
 
-            return valor or "N/A"
+        if (
+            id_demanda != "N/A"
+            and status != "N/A"
+            and fornecedor != "N/A"
+        ):
+            break
 
-        return (
-            extrair_por_regex("idDemanda"),
-            extrair_por_regex("excecao"),
-            extrair_por_regex("provedor"),
-        )
+    if (
+        id_demanda == "N/A"
+        or status == "N/A"
+        or fornecedor == "N/A"
+    ):
+        try:
+            raiz = ET.fromstring(conteudo)
+        except (ET.ParseError, ValueError):
+            raiz = None
 
-    id_demanda = extrair_valor_xml(
-        raiz,
-        [
-            "idDemanda",
-            "iddemanda",
-        ],
-    )
+        if raiz is not None:
+            if id_demanda == "N/A":
+                id_demanda = extrair_valor_xml(
+                    raiz,
+                    ["idDemanda", "iddemanda"],
+                )
 
-    status = extrair_valor_xml(
-        raiz,
-        [
-            "excecao",
-        ],
-    )
+            if status == "N/A":
+                status = extrair_valor_xml(
+                    raiz,
+                    ["excecao"],
+                )
 
-    fornecedor = extrair_valor_xml(
-        raiz,
-        [
-            "provedor",
-        ],
-    )
+            if fornecedor == "N/A":
+                fornecedor = extrair_valor_xml(
+                    raiz,
+                    ["provedor"],
+                )
 
     return (
         id_demanda,
@@ -607,6 +665,10 @@ def buscar_dados_demanda(
             resposta = sessao.get(
                 URL_API_ACOMPANHAMENTO,
                 params=parametros,
+                headers={
+                    "Accept": "application/xml, text/xml, application/xhtml+xml, */*",
+                    "User-Agent": "Mozilla/5.0",
+                },
                 timeout=(
                     TIMEOUT_CONEXAO,
                     TIMEOUT_LEITURA_ACOMPANHAMENTO,
