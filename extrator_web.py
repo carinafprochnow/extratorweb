@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import zipfile
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 
@@ -13,8 +14,13 @@ import streamlit as st
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-URL_API_PROJURIS = "https://api.projurisadv.com.br/adv-service/consulta/central-captura-processo"
-URL_API_ACOMPANHAMENTO = "https://broly.sajadv.com.br/api/acompanhamento"
+URL_API_PROJURIS = (
+    "https://api.projurisadv.com.br/"
+    "adv-service/consulta/central-captura-processo"
+)
+URL_API_ACOMPANHAMENTO = (
+    "https://broly.sajadv.com.br/api/acompanhamento"
+)
 
 QUANTIDADE_POR_PAGINA = 100
 TIMEOUT_CONEXAO = 15
@@ -25,52 +31,110 @@ MAX_TENTATIVAS_DEMANDA = 4
 MAX_THREADS = 20
 INTERVALO_CHECKPOINT = 50
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v2"
+VERSAO_CHECKPOINT = "v3"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
 except KeyError:
-    st.error("Erro: TOKEN_FORNECEDOR não configurado nos Secrets.")
+    st.error(
+        "Erro: TOKEN_FORNECEDOR não configurado nos Secrets."
+    )
     st.stop()
 
 MAPA_FILTROS = {
     "ERRO": "ERRO",
     "EM_ANDAMENTO": "FILTRO_EM_ANDAMENTO",
     "PENDENTE": "FILTRO_PENDENTES",
-    "VINCULADOS": "VINCULADOS",
-    "OUTROS (Segredo/Credencial)": "ERRO",
+    "VINCULADOS": "VINCULADOS"
 }
 
 MAPA_CNJ = {
-    "TRF1": ".4.01.", "TRF2": ".4.02.", "TRF3": ".4.03.", "TRF4": ".4.04.",
-    "TRF5": ".4.05.", "TRF6": ".4.06.",
-    "TRT1": ".5.01.", "TRT2": ".5.02.", "TRT3": ".5.03.", "TRT4": ".5.04.",
-    "TRT5": ".5.05.", "TRT6": ".5.06.", "TRT7": ".5.07.", "TRT8": ".5.08.",
-    "TRT9": ".5.09.", "TRT10": ".5.10.", "TRT11": ".5.11.", "TRT12": ".5.12.",
-    "TRT13": ".5.13.", "TRT14": ".5.14.", "TRT15": ".5.15.", "TRT16": ".5.16.",
-    "TRT17": ".5.17.", "TRT18": ".5.18.", "TRT19": ".5.19.", "TRT20": ".5.20.",
-    "TRT21": ".5.21.", "TRT22": ".5.22.", "TRT23": ".5.23.", "TRT24": ".5.24.",
-    "TJAC": ".8.01.", "TJAL": ".8.02.", "TJAM": ".8.04.", "TJAP": ".8.03.",
-    "TJBA": ".8.05.", "TJCE": ".8.06.", "TJDFT": ".8.07.", "TJES": ".8.08.",
-    "TJGO": ".8.09.", "TJMA": ".8.10.", "TJMG": ".8.13.", "TJMS": ".8.12.",
-    "TJMT": ".8.11.", "TJPA": ".8.14.", "TJPB": ".8.15.", "TJPE": ".8.17.",
-    "TJPI": ".8.18.", "TJPR": ".8.16.", "TJRJ": ".8.19.", "TJRN": ".8.20.",
-    "TJRO": ".8.22.", "TJRR": ".8.23.", "TJRS": ".8.21.", "TJSC": ".8.24.",
-    "TJSE": ".8.25.", "TJSP": ".8.26.", "TJTO": ".8.27.",
+    "TRF1": ".4.01.",
+    "TRF2": ".4.02.",
+    "TRF3": ".4.03.",
+    "TRF4": ".4.04.",
+    "TRF5": ".4.05.",
+    "TRF6": ".4.06.",
+    "TRT1": ".5.01.",
+    "TRT2": ".5.02.",
+    "TRT3": ".5.03.",
+    "TRT4": ".5.04.",
+    "TRT5": ".5.05.",
+    "TRT6": ".5.06.",
+    "TRT7": ".5.07.",
+    "TRT8": ".5.08.",
+    "TRT9": ".5.09.",
+    "TRT10": ".5.10.",
+    "TRT11": ".5.11.",
+    "TRT12": ".5.12.",
+    "TRT13": ".5.13.",
+    "TRT14": ".5.14.",
+    "TRT15": ".5.15.",
+    "TRT16": ".5.16.",
+    "TRT17": ".5.17.",
+    "TRT18": ".5.18.",
+    "TRT19": ".5.19.",
+    "TRT20": ".5.20.",
+    "TRT21": ".5.21.",
+    "TRT22": ".5.22.",
+    "TRT23": ".5.23.",
+    "TRT24": ".5.24.",
+    "TJAC": ".8.01.",
+    "TJAL": ".8.02.",
+    "TJAM": ".8.04.",
+    "TJAP": ".8.03.",
+    "TJBA": ".8.05.",
+    "TJCE": ".8.06.",
+    "TJDFT": ".8.07.",
+    "TJES": ".8.08.",
+    "TJGO": ".8.09.",
+    "TJMA": ".8.10.",
+    "TJMG": ".8.13.",
+    "TJMS": ".8.12.",
+    "TJMT": ".8.11.",
+    "TJPA": ".8.14.",
+    "TJPB": ".8.15.",
+    "TJPE": ".8.17.",
+    "TJPI": ".8.18.",
+    "TJPR": ".8.16.",
+    "TJRJ": ".8.19.",
+    "TJRN": ".8.20.",
+    "TJRO": ".8.22.",
+    "TJRR": ".8.23.",
+    "TJRS": ".8.21.",
+    "TJSC": ".8.24.",
+    "TJSE": ".8.25.",
+    "TJSP": ".8.26.",
+    "TJTO": ".8.27.",
 }
 
 DIC_TRIBUNAIS = {
     "TODOS": ["TODOS"],
-    "JUSTIÇA FEDERAL": ["TODOS"] + sorted(
+    "JUSTIÇA FEDERAL": [
+        "TODOS"
+    ] + sorted(
         k for k in MAPA_CNJ if k.startswith("TRF")
     ),
-    "JUSTIÇA DO TRABALHO": ["TODOS"] + sorted(
+    "JUSTIÇA DO TRABALHO": [
+        "TODOS"
+    ] + sorted(
         k for k in MAPA_CNJ if k.startswith("TRT")
     ),
-    "JUSTIÇA ESTADUAL": ["TODOS"] + sorted(
+    "JUSTIÇA ESTADUAL": [
+        "TODOS"
+    ] + sorted(
         k for k in MAPA_CNJ if k.startswith("TJ")
     ),
 }
+
+COLUNAS_RESULTADO = [
+    "Processo",
+    "Tribunal",
+    "ID Demanda",
+    "Status",
+    "Fornecedor",
+    "Link",
+]
 
 _thread_local = threading.local()
 
@@ -82,8 +146,17 @@ def criar_sessao_http():
         read=0,
         status=3,
         backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
+        status_forcelist=[
+            429,
+            500,
+            502,
+            503,
+            504,
+        ],
+        allowed_methods=[
+            "GET",
+            "POST",
+        ],
         raise_on_status=False,
     )
 
@@ -129,25 +202,44 @@ def gerar_caminho_checkpoint(
     ambito,
     tribunal_sigla,
 ):
-    identificador = "|".join([
-        VERSAO_CHECKPOINT,
-        token_usuario,
-        cd_arrendatario,
-        status_usuario,
-        ambito,
-        tribunal_sigla,
-    ])
+    identificador = "|".join(
+        [
+            VERSAO_CHECKPOINT,
+            token_usuario,
+            cd_arrendatario,
+            status_usuario,
+            ambito,
+            tribunal_sigla,
+        ]
+    )
 
     hash_execucao = hashlib.sha256(
         identificador.encode("utf-8")
     ).hexdigest()[:16]
 
-    arrendatario_seguro = limpar_identificador(cd_arrendatario)
+    arrendatario_seguro = limpar_identificador(
+        cd_arrendatario
+    )
 
     return os.path.join(
         "/tmp",
-        f"checkpoint_projuris_{arrendatario_seguro}_{hash_execucao}.csv",
+        (
+            "checkpoint_projuris_"
+            f"{arrendatario_seguro}_"
+            f"{hash_execucao}.csv"
+        ),
     )
+
+
+def normalizar_dataframe_resultados(df):
+    for coluna in COLUNAS_RESULTADO:
+        if coluna not in df.columns:
+            df[coluna] = "N/A"
+
+    df = df[COLUNAS_RESULTADO]
+    df = df.fillna("N/A")
+
+    return df
 
 
 def salvar_checkpoint(resultados, caminho):
@@ -155,7 +247,12 @@ def salvar_checkpoint(resultados, caminho):
         return
 
     df = pd.DataFrame(resultados)
-    df = df.drop_duplicates(subset=["Processo"], keep="last")
+    df = normalizar_dataframe_resultados(df)
+
+    df = df.drop_duplicates(
+        subset=["Processo"],
+        keep="last",
+    )
 
     caminho_temporario = f"{caminho}.tmp"
 
@@ -165,7 +262,10 @@ def salvar_checkpoint(resultados, caminho):
         encoding="utf-8-sig",
     )
 
-    os.replace(caminho_temporario, caminho)
+    os.replace(
+        caminho_temporario,
+        caminho,
+    )
 
 
 def carregar_checkpoint(caminho):
@@ -179,31 +279,32 @@ def carregar_checkpoint(caminho):
             encoding="utf-8-sig",
         )
 
-        colunas_esperadas = {
-            "Processo",
-            "Tribunal",
-            "ID Central",
-            "ID Demanda",
-            "Situação",
-            "Link",
-        }
-
-        if not colunas_esperadas.issubset(set(df.columns)):
+        if not set(COLUNAS_RESULTADO).issubset(
+            set(df.columns)
+        ):
             return []
 
-        df = df.fillna("N/A")
+        df = normalizar_dataframe_resultados(df)
+
         df = df.drop_duplicates(
             subset=["Processo"],
             keep="last",
         )
 
-        return df.to_dict(orient="records")
+        return df.to_dict(
+            orient="records"
+        )
 
     except Exception:
         return []
 
 
-def consultar_pagina_projuris(sessao, headers, filtro, pagina):
+def consultar_pagina_projuris(
+    sessao,
+    headers,
+    filtro,
+    pagina,
+):
     payload = {
         "habilitado": True,
         "tipoFiltroConsulta": filtro,
@@ -216,7 +317,10 @@ def consultar_pagina_projuris(sessao, headers, filtro, pagina):
 
     ultimo_erro = None
 
-    for tentativa in range(1, MAX_TENTATIVAS_PAGINA + 1):
+    for tentativa in range(
+        1,
+        MAX_TENTATIVAS_PAGINA + 1,
+    ):
         try:
             return sessao.post(
                 URL_API_PROJURIS,
@@ -231,35 +335,43 @@ def consultar_pagina_projuris(sessao, headers, filtro, pagina):
 
         except requests.exceptions.ReadTimeout:
             ultimo_erro = (
-                f"A API demorou mais de {TIMEOUT_LEITURA_PROJURIS} "
+                "A API demorou mais de "
+                f"{TIMEOUT_LEITURA_PROJURIS} "
                 "segundos para responder."
             )
 
         except requests.exceptions.ConnectTimeout:
             ultimo_erro = (
-                "O tempo limite de conexão com a API foi atingido."
+                "O tempo limite de conexão com a API "
+                "foi atingido."
             )
 
         except requests.exceptions.ConnectionError as erro:
-            ultimo_erro = f"Erro de conexão: {erro}"
+            ultimo_erro = (
+                f"Erro de conexão: {erro}"
+            )
 
         except requests.exceptions.RequestException as erro:
-            ultimo_erro = f"Erro na requisição: {erro}"
+            ultimo_erro = (
+                f"Erro na requisição: {erro}"
+            )
 
         if tentativa < MAX_TENTATIVAS_PAGINA:
             espera = tentativa * 5
 
             st.warning(
-                f"⏳ A página {pagina} demorou para responder. "
+                f"⏳ A página {pagina} demorou para "
+                "responder. "
                 f"Nova tentativa {tentativa + 1} de "
-                f"{MAX_TENTATIVAS_PAGINA} em {espera} segundos."
+                f"{MAX_TENTATIVAS_PAGINA} em "
+                f"{espera} segundos."
             )
 
             time.sleep(espera)
 
     raise RuntimeError(
-        f"Não foi possível consultar a página {pagina} após "
-        f"{MAX_TENTATIVAS_PAGINA} tentativas. "
+        f"Não foi possível consultar a página {pagina} "
+        f"após {MAX_TENTATIVAS_PAGINA} tentativas. "
         f"Último erro: {ultimo_erro}"
     )
 
@@ -278,7 +390,11 @@ def extrair_numero_processo(item):
                 "numeroProcesso"
             )
 
-    return str(valor).strip() if valor else "N/A"
+    return (
+        str(valor).strip()
+        if valor
+        else "N/A"
+    )
 
 
 def processo_corresponde_ao_filtro(
@@ -295,12 +411,17 @@ def processo_corresponde_ao_filtro(
         "JUSTIÇA ESTADUAL": ".8.",
     }
 
-    codigo_ambito = codigos_ambito.get(ambito, "")
+    codigo_ambito = codigos_ambito.get(
+        ambito,
+        "",
+    )
 
     if tribunal_sigla == "TODOS":
         return codigo_ambito in numero_processo
 
-    codigo_especifico = MAPA_CNJ.get(tribunal_sigla)
+    codigo_especifico = MAPA_CNJ.get(
+        tribunal_sigla
+    )
 
     return bool(
         codigo_especifico
@@ -308,12 +429,17 @@ def processo_corresponde_ao_filtro(
     )
 
 
-def identificar_tribunal(numero_processo, tribunal_api):
+def identificar_tribunal(
+    numero_processo,
+    tribunal_api,
+):
     for sigla, codigo in MAPA_CNJ.items():
         if codigo in numero_processo:
             return sigla
 
-    tribunal_api = str(tribunal_api or "").strip()
+    tribunal_api = str(
+        tribunal_api or ""
+    ).strip()
 
     return (
         tribunal_api
@@ -322,7 +448,10 @@ def identificar_tribunal(numero_processo, tribunal_api):
     )
 
 
-def montar_link_completo(cd_arrendatario, id_central):
+def montar_link_completo(
+    cd_arrendatario,
+    id_central,
+):
     return (
         f"{URL_API_ACOMPANHAMENTO}"
         f"?token={TOKEN_FORNECEDOR}"
@@ -331,7 +460,130 @@ def montar_link_completo(cd_arrendatario, id_central):
     )
 
 
-def buscar_id_demanda(cd_arrendatario, id_central):
+def nome_local_tag(tag):
+    """
+    Remove namespaces XML.
+
+    Exemplo:
+    {http://www.w3.org/1999/xhtml}provedor
+    vira:
+    provedor
+    """
+    return str(tag).split("}")[-1]
+
+
+def extrair_valor_xml(raiz, nomes_possiveis):
+    """
+    Procura uma tag ignorando:
+    - namespace;
+    - diferença entre maiúsculas e minúsculas;
+    - pequenas variações de nome.
+    """
+    nomes_normalizados = {
+        nome.lower()
+        for nome in nomes_possiveis
+    }
+
+    for elemento in raiz.iter():
+        nome = nome_local_tag(
+            elemento.tag
+        ).lower()
+
+        if nome in nomes_normalizados:
+            texto = elemento.text
+
+            if texto is not None:
+                texto = texto.strip()
+
+                if texto:
+                    return texto
+
+    return "N/A"
+
+
+def interpretar_resposta_broly(resposta):
+    """
+    O Broly pode retornar XML/XHTML.
+
+    Esta função extrai:
+    - idDemanda;
+    - excecao;
+    - provedor.
+    """
+    conteudo = resposta.content
+
+    try:
+        raiz = ET.fromstring(conteudo)
+
+    except ET.ParseError:
+        texto = resposta.text or ""
+
+        def extrair_por_regex(tag):
+            padrao = (
+                rf"<(?:\w+:)?{tag}\b[^>]*>"
+                r"\s*(.*?)\s*"
+                rf"</(?:\w+:)?{tag}>"
+            )
+
+            correspondencia = re.search(
+                padrao,
+                texto,
+                flags=(
+                    re.IGNORECASE
+                    | re.DOTALL
+                ),
+            )
+
+            if not correspondencia:
+                return "N/A"
+
+            valor = re.sub(
+                r"<[^>]+>",
+                "",
+                correspondencia.group(1),
+            ).strip()
+
+            return valor or "N/A"
+
+        return (
+            extrair_por_regex("idDemanda"),
+            extrair_por_regex("excecao"),
+            extrair_por_regex("provedor"),
+        )
+
+    id_demanda = extrair_valor_xml(
+        raiz,
+        [
+            "idDemanda",
+            "iddemanda",
+        ],
+    )
+
+    status = extrair_valor_xml(
+        raiz,
+        [
+            "excecao",
+        ],
+    )
+
+    fornecedor = extrair_valor_xml(
+        raiz,
+        [
+            "provedor",
+        ],
+    )
+
+    return (
+        id_demanda,
+        status,
+        fornecedor,
+    )
+
+
+def buscar_dados_demanda(
+    cd_arrendatario,
+    id_central,
+):
     sessao = obter_sessao_thread()
 
     parametros = {
@@ -347,7 +599,10 @@ def buscar_id_demanda(cd_arrendatario, id_central):
 
     ultimo_erro = None
 
-    for tentativa in range(1, MAX_TENTATIVAS_DEMANDA + 1):
+    for tentativa in range(
+        1,
+        MAX_TENTATIVAS_DEMANDA + 1,
+    ):
         try:
             resposta = sessao.get(
                 URL_API_ACOMPANHAMENTO,
@@ -359,28 +614,28 @@ def buscar_id_demanda(cd_arrendatario, id_central):
             )
 
             if resposta.status_code == 200:
-                try:
-                    dados = resposta.json()
+                (
+                    id_demanda,
+                    status,
+                    fornecedor,
+                ) = interpretar_resposta_broly(
+                    resposta
+                )
 
-                except ValueError:
-                    return (
-                        "N/A",
-                        "RESPOSTA JSON INVÁLIDA",
-                        link_completo,
-                    )
-
-                id_demanda = dados.get("idDemanda")
-
-                if id_demanda:
-                    return (
-                        str(id_demanda),
-                        "SUCESSO",
-                        link_completo,
+                if (
+                    id_demanda == "N/A"
+                    and status == "N/A"
+                    and fornecedor == "N/A"
+                ):
+                    status = (
+                        "DADOS NÃO ENCONTRADOS "
+                        "NA RESPOSTA DO BROLY"
                     )
 
                 return (
-                    "N/A",
-                    "ID NÃO ENCONTRADO",
+                    id_demanda,
+                    status,
+                    fornecedor,
                     link_completo,
                 )
 
@@ -392,56 +647,91 @@ def buscar_id_demanda(cd_arrendatario, id_central):
                 504,
             ]:
                 ultimo_erro = (
-                    f"ERRO HTTP {resposta.status_code}"
+                    "ERRO HTTP "
+                    f"{resposta.status_code}"
                 )
 
-                if tentativa < MAX_TENTATIVAS_DEMANDA:
-                    time.sleep(tentativa * 2)
+                if (
+                    tentativa
+                    < MAX_TENTATIVAS_DEMANDA
+                ):
+                    time.sleep(
+                        tentativa * 2
+                    )
                     continue
 
             return (
                 "N/A",
-                f"ERRO HTTP {resposta.status_code}",
+                (
+                    "ERRO HTTP "
+                    f"{resposta.status_code}"
+                ),
+                "N/A",
                 link_completo,
             )
 
         except requests.exceptions.ReadTimeout:
-            ultimo_erro = "TIMEOUT DE LEITURA"
+            ultimo_erro = (
+                "TIMEOUT DE LEITURA"
+            )
 
         except requests.exceptions.ConnectTimeout:
-            ultimo_erro = "TIMEOUT DE CONEXÃO"
+            ultimo_erro = (
+                "TIMEOUT DE CONEXÃO"
+            )
 
         except requests.exceptions.ConnectionError as erro:
-            ultimo_erro = f"ERRO DE CONEXÃO: {erro}"
+            ultimo_erro = (
+                "ERRO DE CONEXÃO: "
+                f"{erro}"
+            )
 
         except requests.exceptions.RequestException as erro:
-            ultimo_erro = f"ERRO NA REQUISIÇÃO: {erro}"
+            ultimo_erro = (
+                "ERRO NA REQUISIÇÃO: "
+                f"{erro}"
+            )
 
         if tentativa < MAX_TENTATIVAS_DEMANDA:
-            time.sleep(tentativa * 2)
+            time.sleep(
+                tentativa * 2
+            )
 
     return (
         "N/A",
         ultimo_erro or "ERRO DESCONHECIDO",
+        "N/A",
         link_completo,
     )
 
 
-def consultar_processo(processo, cd_arrendatario):
-    id_central = processo.get("id_central")
+def consultar_processo(
+    processo,
+    cd_arrendatario,
+):
+    id_central = processo.get(
+        "id_central"
+    )
 
     if not id_central:
         return {
             "Processo": processo["Processo"],
             "Tribunal": processo["Tribunal"],
-            "ID Central": "N/A",
             "ID Demanda": "N/A",
-            "Situação": "ID CENTRAL NÃO ENCONTRADO",
+            "Status": (
+                "ID CENTRAL NÃO ENCONTRADO"
+            ),
+            "Fornecedor": "N/A",
             "Link": "N/A",
         }
 
     try:
-        id_demanda, situacao, link = buscar_id_demanda(
+        (
+            id_demanda,
+            status,
+            fornecedor,
+            link,
+        ) = buscar_dados_demanda(
             cd_arrendatario,
             id_central,
         )
@@ -449,9 +739,9 @@ def consultar_processo(processo, cd_arrendatario):
         return {
             "Processo": processo["Processo"],
             "Tribunal": processo["Tribunal"],
-            "ID Central": str(id_central),
             "ID Demanda": id_demanda,
-            "Situação": situacao,
+            "Status": status,
+            "Fornecedor": fornecedor,
             "Link": link,
         }
 
@@ -459,9 +749,12 @@ def consultar_processo(processo, cd_arrendatario):
         return {
             "Processo": processo["Processo"],
             "Tribunal": processo["Tribunal"],
-            "ID Central": str(id_central),
             "ID Demanda": "N/A",
-            "Situação": f"ERRO INESPERADO: {erro}",
+            "Status": (
+                "ERRO INESPERADO: "
+                f"{erro}"
+            ),
+            "Fornecedor": "N/A",
             "Link": montar_link_completo(
                 cd_arrendatario,
                 id_central,
@@ -471,6 +764,10 @@ def consultar_processo(processo, cd_arrendatario):
 
 def gerar_excel_tribunal(df_tribunal):
     output = BytesIO()
+
+    df_tribunal = normalizar_dataframe_resultados(
+        df_tribunal.copy()
+    )
 
     with pd.ExcelWriter(
         output,
@@ -483,19 +780,28 @@ def gerar_excel_tribunal(df_tribunal):
         )
 
         workbook = writer.book
-        worksheet = writer.sheets["Resultados"]
+        worksheet = writer.sheets[
+            "Resultados"
+        ]
 
-        formato_cabecalho = workbook.add_format({
-            "bold": True,
-            "border": 1,
-        })
+        formato_cabecalho = workbook.add_format(
+            {
+                "bold": True,
+                "border": 1,
+            }
+        )
 
-        formato_link = workbook.add_format({
-            "font_color": "blue",
-            "underline": 1,
-        })
+        formato_link = workbook.add_format(
+            {
+                "font_color": "blue",
+                "underline": 1,
+            }
+        )
 
-        for numero_coluna, nome_coluna in enumerate(
+        for (
+            numero_coluna,
+            nome_coluna,
+        ) in enumerate(
             df_tribunal.columns
         ):
             worksheet.write(
@@ -505,14 +811,37 @@ def gerar_excel_tribunal(df_tribunal):
                 formato_cabecalho,
             )
 
-        worksheet.set_column("A:A", 28)
-        worksheet.set_column("B:B", 18)
-        worksheet.set_column("C:D", 18)
-        worksheet.set_column("E:E", 35)
-        worksheet.set_column("F:F", 110)
+        worksheet.set_column(
+            "A:A",
+            28,
+        )
+        worksheet.set_column(
+            "B:B",
+            18,
+        )
+        worksheet.set_column(
+            "C:C",
+            18,
+        )
+        worksheet.set_column(
+            "D:D",
+            28,
+        )
+        worksheet.set_column(
+            "E:E",
+            30,
+        )
+        worksheet.set_column(
+            "F:F",
+            110,
+        )
 
         if "Link" in df_tribunal.columns:
-            coluna_link = df_tribunal.columns.get_loc("Link")
+            coluna_link = (
+                df_tribunal.columns.get_loc(
+                    "Link"
+                )
+            )
 
             for indice, link in enumerate(
                 df_tribunal["Link"],
@@ -537,7 +866,10 @@ def gerar_excel_tribunal(df_tribunal):
             len(df_tribunal.columns) - 1,
         )
 
-        worksheet.freeze_panes(1, 0)
+        worksheet.freeze_panes(
+            1,
+            0,
+        )
 
     output.seek(0)
 
@@ -564,7 +896,8 @@ def gerar_zip_por_tribunal(
 
         for tribunal, df_tribunal in grupos:
             tribunal_nome = limpar_nome_arquivo(
-                tribunal or "TRIBUNAL_NAO_IDENTIFICADO"
+                tribunal
+                or "TRIBUNAL_NAO_IDENTIFICADO"
             )
 
             nome_excel = limpar_nome_arquivo(
@@ -574,7 +907,9 @@ def gerar_zip_por_tribunal(
             )
 
             excel = gerar_excel_tribunal(
-                df_tribunal.reset_index(drop=True)
+                df_tribunal.reset_index(
+                    drop=True
+                )
             )
 
             arquivo_zip.writestr(
@@ -592,10 +927,14 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📂 Extração de Capturas - Projuris ADV")
+st.title(
+    "📂 Extração de Capturas - Projuris ADV"
+)
 
 with st.sidebar:
-    st.header("Configurações")
+    st.header(
+        "Configurações"
+    )
 
     token_user_raw = st.text_input(
         "Token",
@@ -609,16 +948,22 @@ with st.sidebar:
 
     status_usuario = st.selectbox(
         "Status",
-        list(MAPA_FILTROS.keys()),
+        list(
+            MAPA_FILTROS.keys()
+        ),
         index=2,
     )
 
     st.divider()
-    st.header("Filtros")
+    st.header(
+        "Filtros"
+    )
 
     ambito = st.selectbox(
         "Âmbito",
-        list(DIC_TRIBUNAIS.keys()),
+        list(
+            DIC_TRIBUNAIS.keys()
+        ),
     )
 
     tribunal_sigla = st.selectbox(
@@ -645,10 +990,14 @@ iniciar_extracao = st.button(
 
 if iniciar_extracao:
     if not token_user_raw:
-        st.error("Insira o Token.")
+        st.error(
+            "Insira o Token."
+        )
 
     elif not cd_arrendatario:
-        st.error("Insira o Arrendatário.")
+        st.error(
+            "Insira o Arrendatário."
+        )
 
     else:
         with st.status(
@@ -659,66 +1008,100 @@ if iniciar_extracao:
             resultados_finais = []
 
             try:
-                sessao_principal = criar_sessao_http()
-                token_limpo = token_user_raw.strip()
+                sessao_principal = (
+                    criar_sessao_http()
+                )
+
+                token_limpo = (
+                    token_user_raw.strip()
+                )
 
                 token_final = (
                     token_limpo
-                    if token_limpo.lower().startswith("bearer ")
+                    if token_limpo.lower().startswith(
+                        "bearer "
+                    )
                     else f"Bearer {token_limpo}"
                 )
 
                 headers = {
                     "Authorization": token_final,
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "User-Agent": "Mozilla/5.0",
+                    "Content-Type": (
+                        "application/json"
+                    ),
+                    "Accept": (
+                        "application/json"
+                    ),
+                    "User-Agent": (
+                        "Mozilla/5.0"
+                    ),
                 }
 
-                caminho_checkpoint = gerar_caminho_checkpoint(
-                    token_limpo,
-                    cd_arrendatario,
-                    status_usuario,
-                    ambito,
-                    tribunal_sigla,
+                caminho_checkpoint = (
+                    gerar_caminho_checkpoint(
+                        token_limpo,
+                        cd_arrendatario,
+                        status_usuario,
+                        ambito,
+                        tribunal_sigla,
+                    )
                 )
 
-                filtro_api = MAPA_FILTROS.get(status_usuario)
+                filtro_api = MAPA_FILTROS.get(
+                    status_usuario
+                )
 
                 filtros_api_lista = (
-                    ["VINCULADOS", "PROCESSO_VINCULADO"]
-                    if status_usuario == "VINCULADOS"
+                    [
+                        "VINCULADOS",
+                        "PROCESSO_VINCULADO",
+                    ]
+                    if status_usuario
+                    == "VINCULADOS"
                     else [filtro_api]
                 )
 
                 dados_brutos = []
 
-                for filtro_atual in filtros_api_lista:
-                    st.write("🛰️ Consultando registros no Projuris ADV...")
+                for filtro_atual in (
+                    filtros_api_lista
+                ):
+                    st.write(
+                        "🛰️ Consultando registros "
+                        "no Projuris ADV..."
+                    )
 
                     pagina = 0
                     total_coletado_filtro = 0
                     total_registros_filtro = None
 
                     while True:
-                        resposta = consultar_pagina_projuris(
-                            sessao_principal,
-                            headers,
-                            filtro_atual,
-                            pagina,
+                        resposta = (
+                            consultar_pagina_projuris(
+                                sessao_principal,
+                                headers,
+                                filtro_atual,
+                                pagina,
+                            )
                         )
 
                         if resposta.status_code != 200:
-                            if resposta.status_code == 412:
+                            if (
+                                resposta.status_code
+                                == 412
+                            ):
                                 raise RuntimeError(
-                                    "Erro 412: verifique o "
-                                    "Arrendatário ou o Token."
+                                    "Erro 412: verifique "
+                                    "o Arrendatário ou "
+                                    "o Token."
                                 )
 
                             raise RuntimeError(
-                                f"Erro HTTP {resposta.status_code} "
+                                "Erro HTTP "
+                                f"{resposta.status_code} "
                                 f"na página {pagina}. "
-                                f"Resposta: {resposta.text[:500]}"
+                                "Resposta: "
+                                f"{resposta.text[:500]}"
                             )
 
                         try:
@@ -726,59 +1109,87 @@ if iniciar_extracao:
 
                         except ValueError as erro:
                             raise RuntimeError(
-                                f"A página {pagina} retornou "
-                                "uma resposta JSON inválida."
+                                f"A página {pagina} "
+                                "retornou uma resposta "
+                                "JSON inválida."
                             ) from erro
 
                         itens = data.get(
-                            "centralCapturaProcessoConsultaResultadoWs",
+                            (
+                                "centralCapturaProcesso"
+                                "ConsultaResultadoWs"
+                            ),
                             [],
                         )
 
                         if not itens:
                             break
 
-                        dados_brutos.extend(itens)
-                        total_coletado_filtro += len(itens)
-
-                        total_registros_filtro = data.get(
-                            "totalRegistros",
-                            total_registros_filtro,
+                        dados_brutos.extend(
+                            itens
                         )
 
-                        if total_registros_filtro is not None:
+                        total_coletado_filtro += (
+                            len(itens)
+                        )
+
+                        total_registros_filtro = (
+                            data.get(
+                                "totalRegistros",
+                                total_registros_filtro,
+                            )
+                        )
+
+                        if (
+                            total_registros_filtro
+                            is not None
+                        ):
                             st.write(
-                                f"📥 {total_coletado_filtro} de "
+                                "📥 "
+                                f"{total_coletado_filtro} "
+                                "de "
                                 f"{total_registros_filtro} "
                                 "registros coletados."
                             )
                         else:
                             st.write(
-                                f"📥 {total_coletado_filtro} "
+                                "📥 "
+                                f"{total_coletado_filtro} "
                                 "registros coletados."
                             )
 
                         if (
-                            total_registros_filtro is not None
+                            total_registros_filtro
+                            is not None
                             and total_coletado_filtro
                             >= total_registros_filtro
                         ):
                             break
 
-                        if len(itens) < QUANTIDADE_POR_PAGINA:
+                        if (
+                            len(itens)
+                            < QUANTIDADE_POR_PAGINA
+                        ):
                             break
 
                         pagina += 1
-                        time.sleep(PAUSA_ENTRE_PAGINAS)
+
+                        time.sleep(
+                            PAUSA_ENTRE_PAGINAS
+                        )
 
                 if not dados_brutos:
                     status_box.update(
-                        label="⚠️ Nenhum registro retornado.",
+                        label=(
+                            "⚠️ Nenhum registro "
+                            "retornado."
+                        ),
                         state="complete",
                     )
 
                     st.warning(
-                        "Nenhum registro foi retornado pela API."
+                        "Nenhum registro foi "
+                        "retornado pela API."
                     )
 
                     st.stop()
@@ -786,8 +1197,10 @@ if iniciar_extracao:
                 processos_filtrados = []
 
                 for item in dados_brutos:
-                    numero_processo = extrair_numero_processo(
-                        item
+                    numero_processo = (
+                        extrair_numero_processo(
+                            item
+                        )
                     )
 
                     if processo_corresponde_ao_filtro(
@@ -795,24 +1208,41 @@ if iniciar_extracao:
                         ambito,
                         tribunal_sigla,
                     ):
-                        processos_filtrados.append({
-                            "Processo": numero_processo,
-                            "Tribunal": identificar_tribunal(
-                                numero_processo,
-                                item.get("tribunal"),
-                            ),
-                            "id_central": item.get(
-                                "codigoCentralCapturaProcesso"
-                            ),
-                        })
+                        processos_filtrados.append(
+                            {
+                                "Processo": (
+                                    numero_processo
+                                ),
+                                "Tribunal": (
+                                    identificar_tribunal(
+                                        numero_processo,
+                                        item.get(
+                                            "tribunal"
+                                        ),
+                                    )
+                                ),
+                                "id_central": (
+                                    item.get(
+                                        (
+                                            "codigoCentral"
+                                            "CapturaProcesso"
+                                        )
+                                    )
+                                ),
+                            }
+                        )
 
                 processos_unicos = {}
 
                 for processo in processos_filtrados:
-                    numero = processo["Processo"]
+                    numero = processo[
+                        "Processo"
+                    ]
 
                     if numero not in processos_unicos:
-                        processos_unicos[numero] = processo
+                        processos_unicos[
+                            numero
+                        ] = processo
 
                 processos_filtrados = list(
                     processos_unicos.values()
@@ -820,37 +1250,51 @@ if iniciar_extracao:
 
                 if not processos_filtrados:
                     status_box.update(
-                        label="⚠️ Nenhum processo encontrado.",
+                        label=(
+                            "⚠️ Nenhum processo "
+                            "encontrado."
+                        ),
                         state="complete",
                     )
 
                     st.warning(
-                        "Nenhum processo encontrado com os "
-                        "filtros selecionados."
+                        "Nenhum processo encontrado "
+                        "com os filtros selecionados."
                     )
 
                     st.stop()
 
-                total_processos = len(processos_filtrados)
+                total_processos = len(
+                    processos_filtrados
+                )
 
                 st.write(
-                    f"🔍 {total_processos} processos únicos encontrados."
+                    f"🔍 {total_processos} "
+                    "processos únicos encontrados."
                 )
 
                 if retomar_checkpoint:
-                    resultados_finais = carregar_checkpoint(
-                        caminho_checkpoint
+                    resultados_finais = (
+                        carregar_checkpoint(
+                            caminho_checkpoint
+                        )
                     )
 
                 processos_ja_concluidos = {
-                    str(resultado["Processo"])
-                    for resultado in resultados_finais
+                    str(
+                        resultado["Processo"]
+                    )
+                    for resultado
+                    in resultados_finais
                 }
 
                 processos_pendentes = [
                     processo
-                    for processo in processos_filtrados
-                    if str(processo["Processo"])
+                    for processo
+                    in processos_filtrados
+                    if str(
+                        processo["Processo"]
+                    )
                     not in processos_ja_concluidos
                 ]
 
@@ -860,26 +1304,32 @@ if iniciar_extracao:
 
                 if quantidade_recuperada > 0:
                     st.info(
-                        f"♻️ {quantidade_recuperada} resultados "
-                        "recuperados da execução anterior."
+                        "♻️ "
+                        f"{quantidade_recuperada} "
+                        "resultados recuperados da "
+                        "execução anterior."
                     )
 
-                total_pendentes = len(processos_pendentes)
+                total_pendentes = len(
+                    processos_pendentes
+                )
 
                 st.write(
-                    f"⚡ Buscando os IDs de demanda de "
+                    "⚡ Buscando dados do Broly para "
                     f"{total_pendentes} processos."
                 )
 
                 aviso_consultas = st.info(
-                    "🔄 Até 20 consultas em andamento no Broly. "
-                    "A contagem pode ficar alguns segundos parada "
-                    "enquanto as respostas são processadas."
+                    "🔄 Até 20 consultas em andamento "
+                    "no Broly. A contagem pode ficar "
+                    "alguns segundos parada enquanto "
+                    "as respostas são processadas."
                 )
 
                 progress_bar = st.progress(
                     min(
-                        quantidade_recuperada / total_processos,
+                        quantidade_recuperada
+                        / total_processos,
                         1.0,
                     )
                 )
@@ -900,36 +1350,61 @@ if iniciar_extracao:
                                 processo,
                                 cd_arrendatario,
                             ): processo
-                            for processo in processos_pendentes
+                            for processo
+                            in processos_pendentes
                         }
 
-                        for future in as_completed(futures):
-                            processo_original = futures[future]
+                        for future in as_completed(
+                            futures
+                        ):
+                            processo_original = (
+                                futures[future]
+                            )
 
                             try:
-                                resultado = future.result()
+                                resultado = (
+                                    future.result()
+                                )
 
                             except Exception as erro:
+                                id_central = (
+                                    processo_original.get(
+                                        "id_central"
+                                    )
+                                )
+
                                 resultado = {
-                                    "Processo": processo_original[
-                                        "Processo"
-                                    ],
-                                    "Tribunal": processo_original[
-                                        "Tribunal"
-                                    ],
-                                    "ID Central": (
-                                        processo_original["id_central"]
-                                        or "N/A"
+                                    "Processo": (
+                                        processo_original[
+                                            "Processo"
+                                        ]
+                                    ),
+                                    "Tribunal": (
+                                        processo_original[
+                                            "Tribunal"
+                                        ]
                                     ),
                                     "ID Demanda": "N/A",
-                                    "Situação": (
-                                        "ERRO INESPERADO NA THREAD: "
+                                    "Status": (
+                                        "ERRO INESPERADO "
+                                        "NA THREAD: "
                                         f"{erro}"
                                     ),
-                                    "Link": "N/A",
+                                    "Fornecedor": "N/A",
+                                    "Link": (
+                                        montar_link_completo(
+                                            cd_arrendatario,
+                                            id_central,
+                                        )
+                                        if id_central
+                                        else "N/A"
+                                    ),
                                 }
 
-                            resultados_finais.append(resultado)
+                            resultados_finais.append(
+                                resultado
+                            )
+
                             concluidos_nesta_execucao += 1
 
                             total_concluido = (
@@ -939,13 +1414,15 @@ if iniciar_extracao:
 
                             progress_bar.progress(
                                 min(
-                                    total_concluido / total_processos,
+                                    total_concluido
+                                    / total_processos,
                                     1.0,
                                 )
                             )
 
                             tempo_decorrido = (
-                                time.monotonic() - inicio
+                                time.monotonic()
+                                - inicio
                             )
 
                             media = (
@@ -958,19 +1435,30 @@ if iniciar_extracao:
                                 - concluidos_nesta_execucao
                             )
 
-                            estimativa = media * restantes
-                            minutos = int(estimativa // 60)
-                            segundos = int(estimativa % 60)
+                            estimativa = (
+                                media * restantes
+                            )
+
+                            minutos = int(
+                                estimativa // 60
+                            )
+
+                            segundos = int(
+                                estimativa % 60
+                            )
 
                             texto_progresso.write(
-                                f"✅ {total_concluido} de "
-                                f"{total_processos} processos consultados."
+                                "✅ "
+                                f"{total_concluido} de "
+                                f"{total_processos} "
+                                "processos consultados."
                             )
 
                             texto_estimativa.caption(
                                 f"Restantes: {restantes} | "
-                                f"Estimativa aproximada: "
-                                f"{minutos} min {segundos} s"
+                                "Estimativa aproximada: "
+                                f"{minutos} min "
+                                f"{segundos} s"
                             )
 
                             if (
@@ -992,16 +1480,29 @@ if iniciar_extracao:
                 texto_progresso.empty()
                 texto_estimativa.empty()
 
-                df_final = pd.DataFrame(resultados_finais)
+                df_final = pd.DataFrame(
+                    resultados_finais
+                )
 
-                df_final = df_final.drop_duplicates(
-                    subset=["Processo"],
-                    keep="last",
+                df_final = (
+                    normalizar_dataframe_resultados(
+                        df_final
+                    )
+                )
+
+                df_final = (
+                    df_final.drop_duplicates(
+                        subset=["Processo"],
+                        keep="last",
+                    )
                 )
 
                 ordem_processos = {
-                    str(processo["Processo"]): indice
-                    for indice, processo in enumerate(
+                    str(
+                        processo["Processo"]
+                    ): indice
+                    for indice, processo
+                    in enumerate(
                         processos_filtrados
                     )
                 }
@@ -1017,30 +1518,41 @@ if iniciar_extracao:
                         "_ordem",
                         na_position="last",
                     )
-                    .drop(columns=["_ordem"])
-                    .reset_index(drop=True)
+                    .drop(
+                        columns=["_ordem"]
+                    )
+                    .reset_index(
+                        drop=True
+                    )
                 )
 
-                total_sucesso = (
-                    df_final["Situação"]
-                    .eq("SUCESSO")
+                total_com_id_demanda = (
+                    df_final["ID Demanda"]
+                    .astype(str)
+                    .str.strip()
+                    .ne("N/A")
                     .sum()
                 )
 
-                total_sem_sucesso = (
-                    len(df_final) - total_sucesso
+                total_sem_id_demanda = (
+                    len(df_final)
+                    - total_com_id_demanda
                 )
 
                 quantidade_tribunais = (
                     df_final["Tribunal"]
-                    .fillna("TRIBUNAL_NAO_IDENTIFICADO")
+                    .fillna(
+                        "TRIBUNAL_NAO_IDENTIFICADO"
+                    )
                     .nunique()
                 )
 
-                output_zip = gerar_zip_por_tribunal(
-                    df_final,
-                    status_usuario,
-                    cd_arrendatario,
+                output_zip = (
+                    gerar_zip_por_tribunal(
+                        df_final,
+                        status_usuario,
+                        cd_arrendatario,
+                    )
                 )
 
                 nome_zip = limpar_nome_arquivo(
@@ -1051,40 +1563,57 @@ if iniciar_extracao:
                 )
 
                 status_box.update(
-                    label="✅ Extração concluída!",
+                    label=(
+                        "✅ Extração concluída!"
+                    ),
                     state="complete",
                 )
 
                 st.success(
-                    f"Extração concluída: "
-                    f"{len(df_final)} processos consultados, "
-                    f"{total_sucesso} IDs de demanda encontrados, "
-                    f"{total_sem_sucesso} registros sem sucesso e "
-                    f"{quantidade_tribunais} planilhas geradas."
+                    "Extração concluída: "
+                    f"{len(df_final)} processos "
+                    "consultados, "
+                    f"{total_com_id_demanda} IDs de "
+                    "demanda encontrados, "
+                    f"{total_sem_id_demanda} registros "
+                    "sem ID de demanda e "
+                    f"{quantidade_tribunais} "
+                    "planilhas geradas."
                 )
 
-                if total_sem_sucesso > 0:
+                if total_sem_id_demanda > 0:
                     st.warning(
-                        "Alguns processos não retornaram um ID de "
-                        "demanda. Consulte a coluna 'Situação' "
-                        "nas planilhas."
+                        "Alguns processos não retornaram "
+                        "um ID de demanda. Consulte as "
+                        "colunas 'Status', 'Fornecedor' "
+                        "e 'Link' nas planilhas."
                     )
 
                 st.download_button(
-                    label="📥 Baixar planilhas por tribunal",
+                    label=(
+                        "📥 Baixar planilhas "
+                        "por tribunal"
+                    ),
                     data=output_zip.getvalue(),
                     file_name=nome_zip,
                     mime="application/zip",
                 )
 
-                if os.path.exists(caminho_checkpoint):
+                if os.path.exists(
+                    caminho_checkpoint
+                ):
                     try:
-                        os.remove(caminho_checkpoint)
+                        os.remove(
+                            caminho_checkpoint
+                        )
                     except OSError:
                         pass
 
             except Exception as erro:
-                if caminho_checkpoint and resultados_finais:
+                if (
+                    caminho_checkpoint
+                    and resultados_finais
+                ):
                     try:
                         salvar_checkpoint(
                             resultados_finais,
@@ -1094,13 +1623,18 @@ if iniciar_extracao:
                         pass
 
                 status_box.update(
-                    label="❌ Erro durante a extração",
+                    label=(
+                        "❌ Erro durante a extração"
+                    ),
                     state="error",
                 )
 
-                st.error(f"Erro: {erro}")
+                st.error(
+                    f"Erro: {erro}"
+                )
 
                 st.info(
-                    "Caso existam resultados já processados, "
-                    "eles foram preservados para uma nova tentativa."
+                    "Caso existam resultados já "
+                    "processados, eles foram preservados "
+                    "para uma nova tentativa."
                 )
