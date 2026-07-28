@@ -45,7 +45,8 @@ MAPA_FILTROS = {
     "ERRO": "ERRO",
     "EM_ANDAMENTO": "FILTRO_EM_ANDAMENTO",
     "PENDENTE": "FILTRO_PENDENTES",
-    "VINCULADOS": "VINCULADOS"
+    "VINCULADOS": "VINCULADOS",
+    "OUTROS (Segredo/Credencial)": "ERRO",
 }
 
 MAPA_CNJ = {
@@ -1696,7 +1697,5 @@ if iniciar_extracao:
                 )
 
                 st.info(
-                    "Caso existam resultados já "
-                    "processados, eles foram preservados "
-                    "para uma nova tentativa."
+                    "Caso existam resultados já processados, eles foram preservados para uma nova tentativa."
                 )
