@@ -1457,9 +1457,8 @@ st.set_page_config(
 
 st.title("📂 Consulta e Extração de Capturas - Projuris ADV")
 st.caption(
-    "Primeiro consulte as capturas e analise a distribuição. "
-    "Depois aplique os filtros e gere os arquivos sem consultar "
-    "o Broly novamente."
+    "Primeiro consulte as capturas e analise os dados encontrados. "
+    "Depois aplique os filtros e gere os arquivos."
 )
 
 for chave, valor_padrao in {
@@ -1692,7 +1691,6 @@ st.divider()
 st.subheader("🎯 Filtros para extração")
 st.caption(
     "Estes filtros são aplicados aos dados já consultados. "
-    "Alterá-los não faz novas requisições ao Projuris ou ao Broly."
 )
 
 opcoes_grupo = sorted(
