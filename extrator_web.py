@@ -15,7 +15,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 URL_API_PROJURIS = (
-    "https://api.projurisadv.com.br/adv-service/consulta/central-captura-processo"
+    "https://api.projurisadv.com.br/"
+    "adv-service/consulta/central-captura-processo"
 )
 URL_BROLY = (
     "https://broly.sajadv.com.br/api/acompanhamento"
@@ -30,7 +31,7 @@ MAX_TENTATIVAS_DEMANDA = 4
 MAX_THREADS = 20
 INTERVALO_CHECKPOINT = 50
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v4"
+VERSAO_CHECKPOINT = "v5"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -986,22 +987,6 @@ def gerar_zip_por_tribunal(
 
 
 
-def classificar_grupo_fornecedor(fornecedor):
-    valor = str(fornecedor or "").strip()
-    valor_upper = valor.upper()
-
-    if not valor or valor_upper in {"N/A", "NAN", "NONE"}:
-        return "NÃO IDENTIFICADO"
-
-    if "HUB" in valor_upper:
-        return "HUB"
-
-    if "CODILO" in valor_upper:
-        return "CODILO"
-
-    return "OUTROS"
-
-
 def preparar_dataframe_consulta(resultados, processos_filtrados):
     df = pd.DataFrame(resultados)
     df = normalizar_dataframe_resultados(df)
@@ -1020,10 +1005,6 @@ def preparar_dataframe_consulta(resultados, processos_filtrados):
         df.sort_values("_ordem", na_position="last")
         .drop(columns=["_ordem"])
         .reset_index(drop=True)
-    )
-
-    df["Grupo Fornecedor"] = df["Fornecedor"].apply(
-        classificar_grupo_fornecedor
     )
 
     return df
@@ -1213,7 +1194,6 @@ def consultar_capturas_completas(
     )
 
     aviso_consultas = st.info(
-        "🔄 Até 20 consultas em andamento no Broly. "
         "A contagem pode ficar alguns segundos parada enquanto "
         "as respostas são processadas."
     )
@@ -1333,9 +1313,7 @@ def consultar_capturas_completas(
 
 
 def gerar_excel_unico(df_final):
-    return gerar_excel_tribunal(
-        df_final.drop(columns=["Grupo Fornecedor"], errors="ignore")
-    )
+    return gerar_excel_tribunal(df_final)
 
 
 def gerar_zip_por_fornecedor(
@@ -1414,18 +1392,12 @@ def gerar_zip_por_tribunal_e_fornecedor(
 
 def aplicar_filtros_pos_consulta(
     df,
-    grupos_fornecedor,
     fornecedores,
     status_broly,
     tribunais,
     somente_com_id,
 ):
     df_filtrado = df.copy()
-
-    if grupos_fornecedor:
-        df_filtrado = df_filtrado[
-            df_filtrado["Grupo Fornecedor"].isin(grupos_fornecedor)
-        ]
 
     if fornecedores:
         df_filtrado = df_filtrado[
@@ -1450,6 +1422,20 @@ def aplicar_filtros_pos_consulta(
     return df_filtrado.reset_index(drop=True)
 
 
+def criar_opcoes_com_quantidade(df, coluna):
+    contagens = (
+        df[coluna]
+        .fillna("N/A")
+        .astype(str)
+        .value_counts(dropna=False)
+    )
+    mapa = {
+        f"{valor} ({quantidade:,})".replace(",", "."): valor
+        for valor, quantidade in contagens.items()
+    }
+    return list(mapa.keys()), mapa
+
+
 st.set_page_config(
     page_title="Extrator Projuris Web",
     layout="wide",
@@ -1457,8 +1443,8 @@ st.set_page_config(
 
 st.title("📂 Consulta e Extração de Capturas - Projuris ADV")
 st.caption(
-    "Primeiro consulte as capturas e analise os dados encontrados. "
-    "Depois aplique os filtros e gere os arquivos."
+    "Primeiro consulte as capturas e verifique os resultados. "
+    "Depois aplique os filtros e gere os arquivos desejados."
 )
 
 for chave, valor_padrao in {
@@ -1626,7 +1612,7 @@ aba_fornecedor, aba_status, aba_tribunal, aba_cruzamento = st.tabs([
 with aba_fornecedor:
     resumo_fornecedor = (
         df_consulta.groupby(
-            ["Grupo Fornecedor", "Fornecedor"],
+            ["Fornecedor"],
             dropna=False,
         )
         .size()
@@ -1640,6 +1626,9 @@ with aba_fornecedor:
         resumo_fornecedor,
         use_container_width=True,
         hide_index=True,
+    )
+    st.bar_chart(
+        resumo_fornecedor.set_index("Fornecedor")["Quantidade"]
     )
 
 with aba_status:
@@ -1657,6 +1646,9 @@ with aba_status:
         use_container_width=True,
         hide_index=True,
     )
+    st.bar_chart(
+        resumo_status.set_index("Status")["Quantidade"]
+    )
 
 with aba_tribunal:
     resumo_tribunal = (
@@ -1673,6 +1665,9 @@ with aba_tribunal:
         use_container_width=True,
         hide_index=True,
     )
+    st.bar_chart(
+        resumo_tribunal.set_index("Tribunal")["Quantidade"]
+    )
 
 with aba_cruzamento:
     cruzamento = pd.crosstab(
@@ -1687,56 +1682,92 @@ with aba_cruzamento:
         hide_index=True,
     )
 
+st.subheader("💡 Insights")
+
+contagem_fornecedor = df_consulta["Fornecedor"].value_counts(dropna=False)
+contagem_status = df_consulta["Status"].value_counts(dropna=False)
+contagem_tribunal = df_consulta["Tribunal"].value_counts(dropna=False)
+
+fornecedor_principal = str(contagem_fornecedor.index[0])
+qtd_fornecedor_principal = int(contagem_fornecedor.iloc[0])
+status_principal = str(contagem_status.index[0])
+qtd_status_principal = int(contagem_status.iloc[0])
+tribunal_principal = str(contagem_tribunal.index[0])
+qtd_tribunal_principal = int(contagem_tribunal.iloc[0])
+
+percentual_fornecedor = qtd_fornecedor_principal / total_processos * 100
+percentual_status = qtd_status_principal / total_processos * 100
+
+insights = [
+    f"O fornecedor com mais registros é **{fornecedor_principal}**, com "
+    f"**{qtd_fornecedor_principal:,} processos** "
+    f"({percentual_fornecedor:.1f}% do total).".replace(",", "."),
+    f"O status mais frequente é **{status_principal}**, com "
+    f"**{qtd_status_principal:,} processos** "
+    f"({percentual_status:.1f}% do total).".replace(",", "."),
+    f"O tribunal com mais registros é **{tribunal_principal}**, com "
+    f"**{qtd_tribunal_principal:,} processos**.".replace(",", "."),
+]
+
+if total_sem_id:
+    insights.append(
+        f"Existem **{total_sem_id:,} processos sem ID Demanda**."
+        .replace(",", ".")
+    )
+
+for insight in insights:
+    st.markdown(f"- {insight}")
+
 st.divider()
 st.subheader("🎯 Filtros para extração")
 st.caption(
     "Estes filtros são aplicados aos dados já consultados. "
+    "Alterá-los não faz novas requisições ao Projuris ou ao Broly."
 )
 
-opcoes_grupo = sorted(
-    df_consulta["Grupo Fornecedor"].dropna().astype(str).unique().tolist()
+opcoes_fornecedor_labels, mapa_fornecedor = criar_opcoes_com_quantidade(
+    df_consulta, "Fornecedor"
 )
-opcoes_fornecedor = sorted(
-    df_consulta["Fornecedor"].dropna().astype(str).unique().tolist()
+opcoes_status_labels, mapa_status = criar_opcoes_com_quantidade(
+    df_consulta, "Status"
 )
-opcoes_status = sorted(
-    df_consulta["Status"].dropna().astype(str).unique().tolist()
-)
-opcoes_tribunal = sorted(
-    df_consulta["Tribunal"].dropna().astype(str).unique().tolist()
+opcoes_tribunal_labels, mapa_tribunal = criar_opcoes_com_quantidade(
+    df_consulta, "Tribunal"
 )
 
-f1, f2 = st.columns(2)
+f1, f2, f3 = st.columns(3)
 
 with f1:
-    grupos_selecionados = st.multiselect(
-        "Grupo de fornecedor",
-        options=opcoes_grupo,
-        default=opcoes_grupo,
-        help=(
-            "HUB reúne provedores que contêm 'HUB'; CODILO reúne "
-            "provedores que contêm 'CODILO'; os demais ficam em OUTROS."
-        ),
-    )
-
-    fornecedores_selecionados = st.multiselect(
-        "Fornecedor exato",
-        options=opcoes_fornecedor,
-        default=opcoes_fornecedor,
+    fornecedores_labels = st.multiselect(
+        "Fornecedor",
+        options=opcoes_fornecedor_labels,
+        default=opcoes_fornecedor_labels,
+        help="Valores exatos retornados pela tag <provedor> do Broly.",
     )
 
 with f2:
-    status_selecionados = st.multiselect(
+    status_labels = st.multiselect(
         "Status retornado pelo Broly",
-        options=opcoes_status,
-        default=opcoes_status,
+        options=opcoes_status_labels,
+        default=opcoes_status_labels,
     )
 
-    tribunais_selecionados = st.multiselect(
+with f3:
+    tribunais_labels = st.multiselect(
         "Tribunal",
-        options=opcoes_tribunal,
-        default=opcoes_tribunal,
+        options=opcoes_tribunal_labels,
+        default=opcoes_tribunal_labels,
     )
+
+fornecedores_selecionados = [
+    mapa_fornecedor[label] for label in fornecedores_labels
+]
+status_selecionados = [
+    mapa_status[label] for label in status_labels
+]
+tribunais_selecionados = [
+    mapa_tribunal[label] for label in tribunais_labels
+]
 
 somente_com_id = st.checkbox(
     "Incluir somente registros com ID Demanda",
@@ -1745,7 +1776,6 @@ somente_com_id = st.checkbox(
 
 df_filtrado = aplicar_filtros_pos_consulta(
     df=df_consulta,
-    grupos_fornecedor=grupos_selecionados,
     fornecedores=fornecedores_selecionados,
     status_broly=status_selecionados,
     tribunais=tribunais_selecionados,
@@ -1814,10 +1844,7 @@ else:
         )
     elif organizacao == "Separar por tribunal":
         arquivo_saida = gerar_zip_por_tribunal(
-            df_filtrado.drop(
-                columns=["Grupo Fornecedor"],
-                errors="ignore",
-            ),
+            df_filtrado,
             status_nome,
             arrendatario_nome,
         )
