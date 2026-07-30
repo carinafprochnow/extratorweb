@@ -15,8 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 URL_API_PROJURIS = (
-    "https://api.projurisadv.com.br/"
-    "adv-service/consulta/central-captura-processo"
+    "https://api.projurisadv.com.br/adv-service/consulta/central-captura-processo"
 )
 URL_BROLY = (
     "https://broly.sajadv.com.br/api/acompanhamento"
@@ -31,7 +30,7 @@ MAX_TENTATIVAS_DEMANDA = 4
 MAX_THREADS = 20
 INTERVALO_CHECKPOINT = 50
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v5"
+VERSAO_CHECKPOINT = "v7_codigo_central"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -130,6 +129,7 @@ DIC_TRIBUNAIS = {
 
 COLUNAS_RESULTADO = [
     "Processo",
+    "codigoCentralCapturaProcesso",
     "Tribunal",
     "ID Demanda",
     "Status",
@@ -251,7 +251,7 @@ def salvar_checkpoint(resultados, caminho):
     df = normalizar_dataframe_resultados(df)
 
     df = df.drop_duplicates(
-        subset=["Processo"],
+        subset=["Processo", "codigoCentralCapturaProcesso"],
         keep="last",
     )
 
@@ -513,10 +513,12 @@ def extrair_tag_do_texto(texto, tag):
     if not texto:
         return "N/A"
 
+    texto = html.unescape(str(texto)).replace("\x00", "")
+
     padrao = (
-        rf"<(?:[A-Za-z0-9_.-]+:)?{re.escape(tag)}\\b[^>]*>"
-        rf"\\s*(.*?)\\s*"
-        rf"</(?:[A-Za-z0-9_.-]+:)?{re.escape(tag)}\\s*>"
+        rf"<(?:[A-Za-z0-9_.-]+:)?{re.escape(tag)}\b[^>]*>"
+        rf"\s*(.*?)\s*"
+        rf"</(?:[A-Za-z0-9_.-]+:)?{re.escape(tag)}\s*>"
     )
 
     correspondencia = re.search(
@@ -529,24 +531,102 @@ def extrair_tag_do_texto(texto, tag):
         return "N/A"
 
     valor = correspondencia.group(1)
-    valor = re.sub(r"<!\\[CDATA\\[(.*?)\\]\\]>", r"\\1", valor, flags=re.DOTALL)
+    valor = re.sub(
+        r"<!\[CDATA\[(.*?)\]\]>",
+        r"\1",
+        valor,
+        flags=re.DOTALL,
+    )
     valor = re.sub(r"<[^>]+>", "", valor)
-    valor = valor.strip()
+    valor = html.unescape(valor).strip()
 
     return valor or "N/A"
+
+
+def extrair_primeira_url(texto):
+    """Extrai a primeira URL da resposta, mesmo quando o XML está quebrado."""
+    if not texto:
+        return "N/A"
+
+    texto = html.unescape(str(texto)).replace("\x00", "")
+
+    url_tag = extrair_tag_do_texto(texto, "url")
+    if url_tag != "N/A":
+        return url_tag
+
+    correspondencia = re.search(
+        r"https?://[^\s<>\"\']+",
+        texto,
+        flags=re.IGNORECASE,
+    )
+
+    if not correspondencia:
+        return "N/A"
+
+    return correspondencia.group(0).rstrip(".,;)")
+
+
+def identificar_fornecedor_pela_url(url):
+    """Usa a URL como fallback quando <provedor> não existe ou está vazio."""
+    url_normalizada = str(url or "").strip().lower()
+
+    if not url_normalizada or url_normalizada == "n/a":
+        return "N/A"
+
+    if "codilo" in url_normalizada:
+        return "CODILO"
+
+    if "hub" in url_normalizada:
+        return "HUB"
+
+    try:
+        dominio = urlparse(url_normalizada).netloc
+    except ValueError:
+        dominio = ""
+
+    return dominio.upper() if dominio else "OUTRO"
+
+
+def extrair_uuid_demanda_fallback(texto, url_encontrada="N/A"):
+    """
+    Localiza o UUID da demanda mesmo quando a tag <idDemanda> está ausente
+    ou o XML vem sem estrutura. Prioriza o UUID imediatamente anterior à URL.
+    """
+    if not texto:
+        return "N/A"
+
+    texto = html.unescape(str(texto)).replace("\x00", "")
+    padrao_uuid = (
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+        r"[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-"
+        r"[0-9a-fA-F]{12}\b"
+    )
+
+    # Caso mais seguro: UUID entre o status principal e a URL da solicitação.
+    if url_encontrada != "N/A":
+        posicao_url = texto.find(url_encontrada)
+        if posicao_url >= 0:
+            trecho_anterior = texto[max(0, posicao_url - 500):posicao_url]
+            uuids = re.findall(padrao_uuid, trecho_anterior)
+            if uuids:
+                return uuids[-1]
+
+    # Fallback: primeiro UUID no início da resposta.
+    correspondencia = re.search(padrao_uuid, texto[:5000])
+    return correspondencia.group(0) if correspondencia else "N/A"
 
 
 def interpretar_resposta_broly(resposta):
     """
     Extrai idDemanda, excecao e provedor do XML/XHTML do Broly.
 
-    A leitura é feita primeiro pelo texto bruto, que é mais tolerante
-    a XML com namespace, cabeçalho, BOM ou pequenas inconsistências.
-    Depois, caso alguma informação não seja localizada, tenta também
-    interpretar a resposta como XML estruturado.
+    Estratégia em camadas:
+    1. Leitura das tags no texto bruto.
+    2. Leitura como XML estruturado.
+    3. Fallback por padrões: UUID e URL.
+    4. Identificação do fornecedor pela URL.
     """
     conteudo = resposta.content or b""
-
     candidatos_texto = []
 
     if resposta.text:
@@ -576,38 +656,22 @@ def interpretar_resposta_broly(resposta):
     id_demanda = "N/A"
     status = "N/A"
     fornecedor = "N/A"
+    url_origem = "N/A"
 
     for texto in candidatos_texto:
         if id_demanda == "N/A":
-            id_demanda = extrair_tag_do_texto(
-                texto,
-                "idDemanda",
-            )
+            id_demanda = extrair_tag_do_texto(texto, "idDemanda")
 
         if status == "N/A":
-            status = extrair_tag_do_texto(
-                texto,
-                "excecao",
-            )
+            status = extrair_tag_do_texto(texto, "excecao")
 
         if fornecedor == "N/A":
-            fornecedor = extrair_tag_do_texto(
-                texto,
-                "provedor",
-            )
+            fornecedor = extrair_tag_do_texto(texto, "provedor")
 
-        if (
-            id_demanda != "N/A"
-            and status != "N/A"
-            and fornecedor != "N/A"
-        ):
-            break
+        if url_origem == "N/A":
+            url_origem = extrair_primeira_url(texto)
 
-    if (
-        id_demanda == "N/A"
-        or status == "N/A"
-        or fornecedor == "N/A"
-    ):
+    if id_demanda == "N/A" or status == "N/A" or fornecedor == "N/A":
         try:
             raiz = ET.fromstring(conteudo)
         except (ET.ParseError, ValueError):
@@ -621,23 +685,29 @@ def interpretar_resposta_broly(resposta):
                 )
 
             if status == "N/A":
-                status = extrair_valor_xml(
-                    raiz,
-                    ["excecao"],
-                )
+                status = extrair_valor_xml(raiz, ["excecao"])
 
             if fornecedor == "N/A":
-                fornecedor = extrair_valor_xml(
-                    raiz,
-                    ["provedor"],
-                )
+                fornecedor = extrair_valor_xml(raiz, ["provedor"])
 
-    return (
-        id_demanda,
-        status,
-        fornecedor,
-    )
+            if url_origem == "N/A":
+                url_origem = extrair_valor_xml(raiz, ["url"])
 
+    # Último recurso para respostas concatenadas ou fora do padrão.
+    for texto in candidatos_texto:
+        if id_demanda == "N/A":
+            id_demanda = extrair_uuid_demanda_fallback(
+                texto,
+                url_origem,
+            )
+
+        if url_origem == "N/A":
+            url_origem = extrair_primeira_url(texto)
+
+    if fornecedor == "N/A":
+        fornecedor = identificar_fornecedor_pela_url(url_origem)
+
+    return id_demanda, status, fornecedor
 
 def buscar_dados_demanda(
     cd_arrendatario,
@@ -779,6 +849,7 @@ def consultar_processo(
     if not id_central:
         return {
             "Processo": processo["Processo"],
+            "codigoCentralCapturaProcesso": str(id_central or "N/A"),
             "Tribunal": processo["Tribunal"],
             "ID Demanda": "N/A",
             "Status": (
@@ -801,6 +872,7 @@ def consultar_processo(
 
         return {
             "Processo": processo["Processo"],
+            "codigoCentralCapturaProcesso": str(id_central or "N/A"),
             "Tribunal": processo["Tribunal"],
             "ID Demanda": id_demanda,
             "Status": status,
@@ -811,6 +883,7 @@ def consultar_processo(
     except Exception as erro:
         return {
             "Processo": processo["Processo"],
+            "codigoCentralCapturaProcesso": str(id_central or "N/A"),
             "Tribunal": processo["Tribunal"],
             "ID Demanda": "N/A",
             "Status": (
@@ -880,7 +953,7 @@ def gerar_excel_tribunal(df_tribunal):
         )
         worksheet.set_column(
             "B:B",
-            18,
+            30,
         )
         worksheet.set_column(
             "C:C",
@@ -888,14 +961,18 @@ def gerar_excel_tribunal(df_tribunal):
         )
         worksheet.set_column(
             "D:D",
-            28,
+            38,
         )
         worksheet.set_column(
             "E:E",
-            30,
+            28,
         )
         worksheet.set_column(
             "F:F",
+            30,
+        )
+        worksheet.set_column(
+            "G:G",
             110,
         )
 
@@ -990,16 +1067,26 @@ def gerar_zip_por_tribunal(
 def preparar_dataframe_consulta(resultados, processos_filtrados):
     df = pd.DataFrame(resultados)
     df = normalizar_dataframe_resultados(df)
-    df = df.drop_duplicates(subset=["Processo"], keep="last")
+    df = df.drop_duplicates(subset=["Processo", "codigoCentralCapturaProcesso"], keep="last")
 
-    ordem_processos = {
-        str(processo["Processo"]): indice
+    ordem_capturas = {
+        (
+            str(processo.get("Processo", "N/A")),
+            str(processo.get("id_central", "N/A")),
+        ): indice
         for indice, processo in enumerate(processos_filtrados)
     }
 
-    df["_ordem"] = (
-        df["Processo"].astype(str).map(ordem_processos)
-    )
+    df["_ordem"] = [
+        ordem_capturas.get(
+            (str(processo), str(codigo_central)),
+            len(ordem_capturas),
+        )
+        for processo, codigo_central in zip(
+            df["Processo"],
+            df["codigoCentralCapturaProcesso"],
+        )
+    ]
 
     df = (
         df.sort_values("_ordem", na_position="last")
@@ -1149,9 +1236,14 @@ def consultar_capturas_completas(
     processos_unicos = {}
 
     for processo in processos_filtrados:
-        numero = processo["Processo"]
-        if numero not in processos_unicos:
-            processos_unicos[numero] = processo
+        # Um mesmo número de processo pode possuir mais de uma captura.
+        # A identidade correta de cada captura é o codigoCentralCapturaProcesso.
+        chave = (
+            str(processo.get("id_central") or "N/A"),
+            str(processo.get("Processo") or "N/A"),
+        )
+        if chave not in processos_unicos:
+            processos_unicos[chave] = processo
 
     processos_filtrados = list(processos_unicos.values())
 
@@ -1161,25 +1253,31 @@ def consultar_capturas_completas(
         )
 
     total_processos = len(processos_filtrados)
-    st.write(f"🔍 {total_processos} processos únicos encontrados.")
+    st.write(f"🔍 {total_processos} capturas encontradas.")
 
     resultados_finais = []
 
     if retomar_checkpoint:
         resultados_finais = carregar_checkpoint(caminho_checkpoint)
 
-    processos_ja_concluidos = {
-        str(resultado["Processo"])
+    capturas_ja_concluidas = {
+        (
+            str(resultado.get("Processo", "N/A")),
+            str(resultado.get("codigoCentralCapturaProcesso", "N/A")),
+        )
         for resultado in resultados_finais
     }
 
     processos_pendentes = [
         processo
         for processo in processos_filtrados
-        if str(processo["Processo"]) not in processos_ja_concluidos
+        if (
+            str(processo.get("Processo", "N/A")),
+            str(processo.get("id_central", "N/A")),
+        ) not in capturas_ja_concluidas
     ]
 
-    quantidade_recuperada = len(processos_ja_concluidos)
+    quantidade_recuperada = len(capturas_ja_concluidas)
 
     if quantidade_recuperada > 0:
         st.info(
@@ -1228,6 +1326,7 @@ def consultar_capturas_completas(
                         id_central = processo_original.get("id_central")
                         resultado = {
                             "Processo": processo_original["Processo"],
+                            "codigoCentralCapturaProcesso": str(id_central or "N/A"),
                             "Tribunal": processo_original["Tribunal"],
                             "ID Demanda": "N/A",
                             "Status": f"ERRO INESPERADO NA THREAD: {erro}",
@@ -1443,8 +1542,8 @@ st.set_page_config(
 
 st.title("📂 Consulta e Extração de Capturas - Projuris ADV")
 st.caption(
-    "Primeiro consulte as capturas e verifique os resultados. "
-    "Depois aplique os filtros e gere os arquivos desejados."
+    "Primeiro consulte as capturas e analise os resultados. "
+    "Depois aplique os filtros e gere os arquivos desejados. "
 )
 
 for chave, valor_padrao in {
@@ -1793,6 +1892,7 @@ st.dataframe(
     df_filtrado[
         [
             "Processo",
+            "codigoCentralCapturaProcesso",
             "Tribunal",
             "ID Demanda",
             "Status",
