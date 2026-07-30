@@ -17,8 +17,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 URL_API_PROJURIS = (
-    "https://api.projurisadv.com.br/"
-    "adv-service/consulta/central-captura-processo"
+    "https://api.projurisadv.com.br/adv-service/consulta/central-captura-processo"
 )
 URL_API_ACOMPANHAMENTO = (
     "https://broly.sajadv.com.br/api/acompanhamento"
@@ -1545,7 +1544,7 @@ st.set_page_config(
 
 st.title("📂 Consulta e Extração de Capturas - Projuris ADV")
 st.caption(
-    "Primeiro consulte as capturas e analise os resultados. "
+    "Primeiro consulte as capturas e analise o resultado. "
     "Depois aplique os filtros e gere os arquivos desejados."
 )
 
@@ -1938,8 +1937,25 @@ else:
 
     if organizacao == "Excel único":
         arquivo_saida = gerar_excel_unico(df_filtrado)
+
+        tribunais_no_arquivo = sorted(
+            {
+                str(tribunal).strip()
+                for tribunal in df_filtrado["Tribunal"].dropna().tolist()
+                if str(tribunal).strip()
+            }
+        )
+
+        if len(tribunais_no_arquivo) == 1:
+            identificador_tribunal = tribunais_no_arquivo[0]
+        elif len(tribunais_no_arquivo) > 1:
+            identificador_tribunal = "MULTIPLOS TRIBUNAIS"
+        else:
+            identificador_tribunal = "TRIBUNAL NAO IDENTIFICADO"
+
         nome_arquivo = limpar_nome_arquivo(
-            f"{status_nome} - FILTRADO - {arrendatario_nome}.xlsx"
+            f"{status_nome} - {identificador_tribunal} - "
+            f"{arrendatario_nome}.xlsx"
         )
         mime = (
             "application/vnd.openxmlformats-officedocument."
