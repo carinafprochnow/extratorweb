@@ -1,4 +1,5 @@
 import hashlib
+import html
 import os
 import re
 import threading
@@ -7,6 +8,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -15,9 +17,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 URL_API_PROJURIS = (
-    "https://api.projurisadv.com.br/adv-service/consulta/central-captura-processo"
+    "https://api.projurisadv.com.br/"
+    "adv-service/consulta/central-captura-processo"
 )
-URL_BROLY = (
+URL_API_ACOMPANHAMENTO = (
     "https://broly.sajadv.com.br/api/acompanhamento"
 )
 
@@ -30,7 +33,7 @@ MAX_TENTATIVAS_DEMANDA = 4
 MAX_THREADS = 20
 INTERVALO_CHECKPOINT = 50
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v7_codigo_central"
+VERSAO_CHECKPOINT = "v8_import_html_urlparse"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -454,7 +457,7 @@ def montar_link_completo(
     id_central,
 ):
     return (
-        f"{URL_BROLY}"
+        f"{URL_API_ACOMPANHAMENTO}"
         f"?token={TOKEN_FORNECEDOR}"
         f"&cdArrendatario={cd_arrendatario}"
         f"&cdCentralCapturaProcesso={id_central}"
@@ -734,7 +737,7 @@ def buscar_dados_demanda(
     ):
         try:
             resposta = sessao.get(
-                URL_BROLY,
+                URL_API_ACOMPANHAMENTO,
                 params=parametros,
                 headers={
                     "Accept": "application/xml, text/xml, application/xhtml+xml, */*",
@@ -1543,7 +1546,7 @@ st.set_page_config(
 st.title("📂 Consulta e Extração de Capturas - Projuris ADV")
 st.caption(
     "Primeiro consulte as capturas e analise os resultados. "
-    "Depois aplique os filtros e gere os arquivos desejados. "
+    "Depois aplique os filtros e gere os arquivos desejados."
 )
 
 for chave, valor_padrao in {
