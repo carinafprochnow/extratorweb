@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import html
 import os
@@ -17,7 +18,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 URL_API_PROJURIS = (
-    "https://api.projurisadv.com.br/adv-service/consulta/central-captura-processo"
+    "https://api.projurisadv.com.br/"
+    "adv-service/consulta/central-captura-processo"
 )
 URL_API_ACOMPANHAMENTO = (
     "https://broly.sajadv.com.br/api/acompanhamento"
@@ -29,10 +31,12 @@ TIMEOUT_LEITURA_PROJURIS = 120
 TIMEOUT_LEITURA_ACOMPANHAMENTO = 60
 MAX_TENTATIVAS_PAGINA = 5
 MAX_TENTATIVAS_DEMANDA = 4
-MAX_THREADS = 20
-INTERVALO_CHECKPOINT = 50
+MAX_THREADS = 5
+INTERVALO_CHECKPOINT = 25
+TAMANHO_LOTE_BROLY = 100
+LIMITE_PREVIA = 100
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v8_import_html_urlparse"
+VERSAO_CHECKPOINT = "v10_estabilidade_lotes"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -290,7 +294,7 @@ def carregar_checkpoint(caminho):
         df = normalizar_dataframe_resultados(df)
 
         df = df.drop_duplicates(
-            subset=["Processo"],
+            subset=["Processo", "codigoCentralCapturaProcesso"],
             keep="last",
         )
 
@@ -1294,8 +1298,9 @@ def consultar_capturas_completas(
     )
 
     aviso_consultas = st.info(
-        "A contagem pode ficar alguns segundos parada enquanto "
-        "as respostas são processadas."
+        f"🔄 Até {MAX_THREADS} consultas simultâneas ao Broly, "
+        f"processadas em lotes de até {TAMANHO_LOTE_BROLY}. "
+        "Isso reduz o consumo de memória e aumenta a estabilidade."
     )
 
     progress_bar = st.progress(
@@ -1309,78 +1314,104 @@ def consultar_capturas_completas(
 
     try:
         if processos_pendentes:
-            with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-                futures = {
-                    executor.submit(
-                        consultar_processo,
-                        processo,
-                        cd_arrendatario,
-                    ): processo
-                    for processo in processos_pendentes
-                }
+            for inicio_lote in range(0, total_pendentes, TAMANHO_LOTE_BROLY):
+                lote = processos_pendentes[
+                    inicio_lote:inicio_lote + TAMANHO_LOTE_BROLY
+                ]
 
-                for future in as_completed(futures):
-                    processo_original = futures[future]
+                with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+                    futures = {
+                        executor.submit(
+                            consultar_processo,
+                            processo,
+                            cd_arrendatario,
+                        ): processo
+                        for processo in lote
+                    }
 
-                    try:
-                        resultado = future.result()
-                    except Exception as erro:
-                        id_central = processo_original.get("id_central")
-                        resultado = {
-                            "Processo": processo_original["Processo"],
-                            "codigoCentralCapturaProcesso": str(id_central or "N/A"),
-                            "Tribunal": processo_original["Tribunal"],
-                            "ID Demanda": "N/A",
-                            "Status": f"ERRO INESPERADO NA THREAD: {erro}",
-                            "Fornecedor": "N/A",
-                            "Link": (
-                                montar_link_completo(
-                                    cd_arrendatario,
-                                    id_central,
-                                )
-                                if id_central
-                                else "N/A"
-                            ),
-                        }
+                    for future in as_completed(futures):
+                        processo_original = futures[future]
 
-                    resultados_finais.append(resultado)
-                    concluidos_nesta_execucao += 1
-                    total_concluido = (
-                        quantidade_recuperada
-                        + concluidos_nesta_execucao
-                    )
+                        try:
+                            resultado = future.result()
+                        except Exception as erro:
+                            id_central = processo_original.get("id_central")
+                            resultado = {
+                                "Processo": processo_original["Processo"],
+                                "codigoCentralCapturaProcesso": str(
+                                    id_central or "N/A"
+                                ),
+                                "Tribunal": processo_original["Tribunal"],
+                                "ID Demanda": "N/A",
+                                "Status": (
+                                    "ERRO INESPERADO NA THREAD: "
+                                    f"{erro}"
+                                ),
+                                "Fornecedor": "N/A",
+                                "Link": (
+                                    montar_link_completo(
+                                        cd_arrendatario,
+                                        id_central,
+                                    )
+                                    if id_central
+                                    else "N/A"
+                                ),
+                            }
 
-                    progress_bar.progress(
-                        min(total_concluido / total_processos, 1.0)
-                    )
-
-                    tempo_decorrido = time.monotonic() - inicio
-                    media = tempo_decorrido / concluidos_nesta_execucao
-                    restantes = (
-                        total_pendentes - concluidos_nesta_execucao
-                    )
-                    estimativa = media * restantes
-                    minutos = int(estimativa // 60)
-                    segundos = int(estimativa % 60)
-
-                    texto_progresso.write(
-                        f"✅ {total_concluido} de {total_processos} "
-                        "processos consultados."
-                    )
-                    texto_estimativa.caption(
-                        f"Restantes: {restantes} | "
-                        f"Estimativa aproximada: {minutos} min {segundos} s"
-                    )
-
-                    if (
-                        concluidos_nesta_execucao
-                        % INTERVALO_CHECKPOINT
-                        == 0
-                    ):
-                        salvar_checkpoint(
-                            resultados_finais,
-                            caminho_checkpoint,
+                        resultados_finais.append(resultado)
+                        concluidos_nesta_execucao += 1
+                        total_concluido = (
+                            quantidade_recuperada
+                            + concluidos_nesta_execucao
                         )
+
+                        progress_bar.progress(
+                            min(total_concluido / total_processos, 1.0)
+                        )
+
+                        tempo_decorrido = time.monotonic() - inicio
+                        media = tempo_decorrido / concluidos_nesta_execucao
+                        restantes = (
+                            total_pendentes - concluidos_nesta_execucao
+                        )
+                        estimativa = media * restantes
+                        minutos = int(estimativa // 60)
+                        segundos = int(estimativa % 60)
+
+                        texto_progresso.write(
+                            f"✅ {total_concluido} de {total_processos} "
+                            "processos consultados."
+                        )
+                        texto_estimativa.caption(
+                            f"Restantes: {restantes} | "
+                            f"Estimativa aproximada: {minutos} min "
+                            f"{segundos} s"
+                        )
+
+                        if (
+                            concluidos_nesta_execucao
+                            % INTERVALO_CHECKPOINT
+                            == 0
+                        ):
+                            salvar_checkpoint(
+                                resultados_finais,
+                                caminho_checkpoint,
+                            )
+
+                # Fecha as conexões mantidas pelas threads do lote e solicita
+                # a liberação de objetos temporários antes do próximo lote.
+                if hasattr(_thread_local, "sessao"):
+                    try:
+                        _thread_local.sessao.close()
+                    except Exception:
+                        pass
+                    try:
+                        delattr(_thread_local, "sessao")
+                    except AttributeError:
+                        pass
+
+                salvar_checkpoint(resultados_finais, caminho_checkpoint)
+                gc.collect()
 
         salvar_checkpoint(resultados_finais, caminho_checkpoint)
 
@@ -1544,8 +1575,8 @@ st.set_page_config(
 
 st.title("📂 Consulta e Extração de Capturas - Projuris ADV")
 st.caption(
-    "Primeiro consulte as capturas e analise o resultado. "
-    "Depois aplique os filtros e gere os arquivos desejados."
+    "Primeiro consulte as capturas e analise a distribuição. "
+    "Depois aplique os filtros e gere os arquivos desejados. "
 )
 
 for chave, valor_padrao in {
@@ -1601,12 +1632,12 @@ with st.sidebar:
     consultar = st.button(
         "🔎 Consultar capturas",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     )
 
     limpar_consulta = st.button(
         "🧹 Limpar consulta atual",
-        use_container_width=True,
+        width="stretch",
         disabled=st.session_state["dados_consulta"] is None,
     )
 
@@ -1669,7 +1700,7 @@ if st.session_state["dados_consulta"] is None:
     st.stop()
 
 
-df_consulta = st.session_state["dados_consulta"].copy()
+df_consulta = st.session_state["dados_consulta"]
 parametros = st.session_state["parametros_consulta"]
 
 st.divider()
@@ -1725,7 +1756,7 @@ with aba_fornecedor:
     ).map(lambda valor: f"{valor:.1f}%".replace(".", ","))
     st.dataframe(
         resumo_fornecedor,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     st.bar_chart(
@@ -1744,7 +1775,7 @@ with aba_status:
     ).map(lambda valor: f"{valor:.1f}%".replace(".", ","))
     st.dataframe(
         resumo_status,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     st.bar_chart(
@@ -1763,7 +1794,7 @@ with aba_tribunal:
     ).map(lambda valor: f"{valor:.1f}%".replace(".", ","))
     st.dataframe(
         resumo_tribunal,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     st.bar_chart(
@@ -1779,7 +1810,7 @@ with aba_cruzamento:
     ).reset_index()
     st.dataframe(
         cruzamento,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -1901,14 +1932,14 @@ st.dataframe(
             "Fornecedor",
             "Link",
         ]
-    ].head(500),
-    use_container_width=True,
+    ].head(LIMITE_PREVIA),
+    width="stretch",
     hide_index=True,
 )
 
-if len(df_filtrado) > 500:
+if len(df_filtrado) > LIMITE_PREVIA:
     st.caption(
-        "A prévia mostra as primeiras 500 linhas. "
+        f"A prévia mostra as primeiras {LIMITE_PREVIA} linhas. "
         "O arquivo incluirá todos os registros selecionados."
     )
 
@@ -1935,69 +1966,97 @@ else:
     status_nome = parametros["status_usuario"]
     arrendatario_nome = parametros["cd_arrendatario"]
 
-    if organizacao == "Excel único":
-        arquivo_saida = gerar_excel_unico(df_filtrado)
-
-        tribunais_no_arquivo = sorted(
-            {
-                str(tribunal).strip()
-                for tribunal in df_filtrado["Tribunal"].dropna().tolist()
-                if str(tribunal).strip()
-            }
-        )
-
-        if len(tribunais_no_arquivo) == 1:
-            identificador_tribunal = tribunais_no_arquivo[0]
-        elif len(tribunais_no_arquivo) > 1:
-            identificador_tribunal = "MULTIPLOS TRIBUNAIS"
-        else:
-            identificador_tribunal = "TRIBUNAL NAO IDENTIFICADO"
-
-        nome_arquivo = limpar_nome_arquivo(
-            f"{status_nome} - {identificador_tribunal} - "
-            f"{arrendatario_nome}.xlsx"
-        )
-        mime = (
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        )
-    elif organizacao == "Separar por tribunal":
-        arquivo_saida = gerar_zip_por_tribunal(
-            df_filtrado,
-            status_nome,
-            arrendatario_nome,
-        )
-        nome_arquivo = limpar_nome_arquivo(
-            f"{status_nome} - POR TRIBUNAL - {arrendatario_nome}.zip"
-        )
-        mime = "application/zip"
-    elif organizacao == "Separar por fornecedor":
-        arquivo_saida = gerar_zip_por_fornecedor(
-            df_filtrado,
-            status_nome,
-            arrendatario_nome,
-        )
-        nome_arquivo = limpar_nome_arquivo(
-            f"{status_nome} - POR FORNECEDOR - {arrendatario_nome}.zip"
-        )
-        mime = "application/zip"
-    else:
-        arquivo_saida = gerar_zip_por_tribunal_e_fornecedor(
-            df_filtrado,
-            status_nome,
-            arrendatario_nome,
-        )
-        nome_arquivo = limpar_nome_arquivo(
-            f"{status_nome} - FORNECEDOR E TRIBUNAL - "
-            f"{arrendatario_nome}.zip"
-        )
-        mime = "application/zip"
-
-    st.download_button(
-        label=f"📥 Baixar {organizacao.lower()}",
-        data=arquivo_saida.getvalue(),
-        file_name=nome_arquivo,
-        mime=mime,
-        type="primary",
-        use_container_width=True,
+    st.caption(
+        "O arquivo só será montado ao clicar no botão abaixo. "
+        "Assim, trocar filtros não recria Excel ou ZIP automaticamente."
     )
+
+    preparar_arquivo = st.button(
+        "⚙️ Preparar arquivo para download",
+        type="primary",
+        width="stretch",
+    )
+
+    if preparar_arquivo:
+        with st.spinner("Gerando arquivo..."):
+            if organizacao == "Excel único":
+                arquivo_saida = gerar_excel_unico(df_filtrado)
+
+                tribunais_no_arquivo = sorted(
+                    {
+                        str(tribunal).strip()
+                        for tribunal in df_filtrado["Tribunal"].dropna().tolist()
+                        if str(tribunal).strip()
+                    }
+                )
+
+                if len(tribunais_no_arquivo) == 1:
+                    identificador_tribunal = tribunais_no_arquivo[0]
+                elif len(tribunais_no_arquivo) == 2:
+                    identificador_tribunal = " + ".join(tribunais_no_arquivo)
+                elif len(tribunais_no_arquivo) > 2:
+                    identificador_tribunal = "MULTIPLOS TRIBUNAIS"
+                else:
+                    identificador_tribunal = "TRIBUNAL NAO IDENTIFICADO"
+
+                nome_arquivo = limpar_nome_arquivo(
+                    f"{status_nome} - {identificador_tribunal} - "
+                    f"{arrendatario_nome}.xlsx"
+                )
+                mime = (
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                )
+            elif organizacao == "Separar por tribunal":
+                arquivo_saida = gerar_zip_por_tribunal(
+                    df_filtrado,
+                    status_nome,
+                    arrendatario_nome,
+                )
+                nome_arquivo = limpar_nome_arquivo(
+                    f"{status_nome} - POR TRIBUNAL - "
+                    f"{arrendatario_nome}.zip"
+                )
+                mime = "application/zip"
+            elif organizacao == "Separar por fornecedor":
+                arquivo_saida = gerar_zip_por_fornecedor(
+                    df_filtrado,
+                    status_nome,
+                    arrendatario_nome,
+                )
+                nome_arquivo = limpar_nome_arquivo(
+                    f"{status_nome} - POR FORNECEDOR - "
+                    f"{arrendatario_nome}.zip"
+                )
+                mime = "application/zip"
+            else:
+                arquivo_saida = gerar_zip_por_tribunal_e_fornecedor(
+                    df_filtrado,
+                    status_nome,
+                    arrendatario_nome,
+                )
+                nome_arquivo = limpar_nome_arquivo(
+                    f"{status_nome} - FORNECEDOR E TRIBUNAL - "
+                    f"{arrendatario_nome}.zip"
+                )
+                mime = "application/zip"
+
+            dados_arquivo = arquivo_saida.getvalue()
+            arquivo_saida.close()
+
+        st.success(
+            f"Arquivo pronto: {nome_arquivo} "
+            f"({len(dados_arquivo) / 1024 / 1024:.2f} MB)"
+        )
+        st.download_button(
+            label=f"📥 Baixar {organizacao.lower()}",
+            data=dados_arquivo,
+            file_name=nome_arquivo,
+            mime=mime,
+            type="primary",
+            width="stretch",
+            on_click="ignore",
+        )
+
+        del dados_arquivo
+        gc.collect()
