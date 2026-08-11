@@ -31,12 +31,12 @@ TIMEOUT_LEITURA_PROJURIS = 120
 TIMEOUT_LEITURA_ACOMPANHAMENTO = 60
 MAX_TENTATIVAS_PAGINA = 5
 MAX_TENTATIVAS_DEMANDA = 4
-MAX_THREADS = 5
+MAX_THREADS = 3
 INTERVALO_CHECKPOINT = 25
-TAMANHO_LOTE_BROLY = 100
-LIMITE_PREVIA = 100
+TAMANHO_LOTE_BROLY = 50
+LIMITE_PREVIA = 50
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v10_estabilidade_lotes"
+VERSAO_CHECKPOINT = "v10_disk_streaming"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -624,63 +624,37 @@ def extrair_uuid_demanda_fallback(texto, url_encontrada="N/A"):
 
 def interpretar_resposta_broly(resposta):
     """
-    Extrai idDemanda, excecao e provedor do XML/XHTML do Broly.
+    Extrai idDemanda, excecao e provedor do Broly com baixo uso de memória.
 
-    Estratégia em camadas:
-    1. Leitura das tags no texto bruto.
-    2. Leitura como XML estruturado.
-    3. Fallback por padrões: UUID e URL.
-    4. Identificação do fornecedor pela URL.
+    Evita criar várias cópias decodificadas do mesmo XML/XHTML, algo que pode
+    consumir muita memória quando a resposta do Broly é muito grande.
     """
     conteudo = resposta.content or b""
-    candidatos_texto = []
 
-    if resposta.text:
-        candidatos_texto.append(resposta.text)
+    try:
+        texto = resposta.text or ""
+    except Exception:
+        texto = ""
 
-    for codificacao in (
-        resposta.encoding,
-        "utf-8-sig",
-        "utf-8",
-        "iso-8859-1",
-        "windows-1252",
+    if not texto and conteudo:
+        texto = conteudo.decode("utf-8", errors="replace")
+
+    id_demanda = extrair_tag_do_texto(texto, "idDemanda")
+    status = extrair_tag_do_texto(texto, "excecao")
+    fornecedor = extrair_tag_do_texto(texto, "provedor")
+    url_origem = extrair_primeira_url(texto)
+
+    # Só monta uma árvore XML se alguma informação importante não veio
+    # pela leitura direta do texto.
+    if (
+        id_demanda == "N/A"
+        or status == "N/A"
+        or fornecedor == "N/A"
+        or url_origem == "N/A"
     ):
-        if not codificacao:
-            continue
-
-        try:
-            texto_decodificado = conteudo.decode(
-                codificacao,
-                errors="replace",
-            )
-        except (LookupError, UnicodeDecodeError):
-            continue
-
-        if texto_decodificado not in candidatos_texto:
-            candidatos_texto.append(texto_decodificado)
-
-    id_demanda = "N/A"
-    status = "N/A"
-    fornecedor = "N/A"
-    url_origem = "N/A"
-
-    for texto in candidatos_texto:
-        if id_demanda == "N/A":
-            id_demanda = extrair_tag_do_texto(texto, "idDemanda")
-
-        if status == "N/A":
-            status = extrair_tag_do_texto(texto, "excecao")
-
-        if fornecedor == "N/A":
-            fornecedor = extrair_tag_do_texto(texto, "provedor")
-
-        if url_origem == "N/A":
-            url_origem = extrair_primeira_url(texto)
-
-    if id_demanda == "N/A" or status == "N/A" or fornecedor == "N/A":
         try:
             raiz = ET.fromstring(conteudo)
-        except (ET.ParseError, ValueError):
+        except (ET.ParseError, ValueError, TypeError):
             raiz = None
 
         if raiz is not None:
@@ -691,27 +665,36 @@ def interpretar_resposta_broly(resposta):
                 )
 
             if status == "N/A":
-                status = extrair_valor_xml(raiz, ["excecao"])
+                status = extrair_valor_xml(
+                    raiz,
+                    ["excecao"],
+                )
 
             if fornecedor == "N/A":
-                fornecedor = extrair_valor_xml(raiz, ["provedor"])
+                fornecedor = extrair_valor_xml(
+                    raiz,
+                    ["provedor"],
+                )
 
             if url_origem == "N/A":
-                url_origem = extrair_valor_xml(raiz, ["url"])
+                url_origem = extrair_valor_xml(
+                    raiz,
+                    ["url"],
+                )
 
-    # Último recurso para respostas concatenadas ou fora do padrão.
-    for texto in candidatos_texto:
-        if id_demanda == "N/A":
-            id_demanda = extrair_uuid_demanda_fallback(
-                texto,
-                url_origem,
-            )
+            del raiz
 
-        if url_origem == "N/A":
-            url_origem = extrair_primeira_url(texto)
+    # Respostas antigas/fora do padrão podem vir concatenadas, sem tags úteis.
+    if id_demanda == "N/A":
+        id_demanda = extrair_uuid_demanda_fallback(
+            texto,
+            url_origem,
+        )
 
     if fornecedor == "N/A":
-        fornecedor = identificar_fornecedor_pela_url(url_origem)
+        fornecedor = identificar_fornecedor_pela_url(
+            url_origem
+        )
 
     return id_demanda, status, fornecedor
 
@@ -1103,6 +1086,171 @@ def preparar_dataframe_consulta(resultados, processos_filtrados):
     return df
 
 
+
+
+def normalizar_token_usuario(token_raw):
+    """Normaliza e valida o token informado antes de enviá-lo no header HTTP."""
+    token = str(token_raw or "").strip()
+
+    # Remove caracteres invisíveis comuns em cópias de navegador/Teams.
+    token = token.replace("\u200b", "").replace("\ufeff", "")
+
+    # Aceita, por conveniência, token colado como URL ou token=valor.
+    if "token=" in token.lower():
+        match = re.search(r"(?:^|[?&])token=([^&]+)", token, flags=re.IGNORECASE)
+        if match:
+            token = match.group(1).strip()
+
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+
+    # Reticências indicam que o token foi copiado truncado/abreviado.
+    if "…" in token or "..." in token:
+        raise ValueError(
+            "O token parece estar abreviado: ele contém reticências (…). "
+            "Copie o token completo da fonte original, sem 'token=', URL ou parâmetros adicionais."
+        )
+
+    # Tokens de autenticação devem ser transmitidos como caracteres ASCII.
+    try:
+        token.encode("ascii")
+    except UnicodeEncodeError as erro:
+        caractere = token[erro.start:erro.end]
+        raise ValueError(
+            "O token contém um caractere inválido ou invisível "
+            f"({caractere!r}). Apague o campo e cole novamente o token completo."
+        ) from erro
+
+    # Remove espaços/quebras acidentais no meio da cópia.
+    token = re.sub(r"\s+", "", token)
+
+    if not token:
+        raise ValueError("Informe um token válido.")
+
+    return token
+
+
+def anexar_resultados_csv(resultados, caminho):
+    """
+    Acrescenta apenas o lote recém-processado ao CSV.
+
+    Isso evita reescrever e manter todos os resultados na memória a cada
+    checkpoint.
+    """
+    if not resultados:
+        return
+
+    df_lote = pd.DataFrame(resultados)
+    df_lote = normalizar_dataframe_resultados(df_lote)
+
+    existe = os.path.exists(caminho) and os.path.getsize(caminho) > 0
+
+    df_lote.to_csv(
+        caminho,
+        mode="a",
+        header=not existe,
+        index=False,
+        encoding="utf-8-sig" if not existe else "utf-8",
+    )
+
+    del df_lote
+
+
+def carregar_chaves_concluidas(caminho):
+    if not os.path.exists(caminho):
+        return set()
+
+    try:
+        df_chaves = pd.read_csv(
+            caminho,
+            dtype=str,
+            usecols=[
+                "Processo",
+                "codigoCentralCapturaProcesso",
+            ],
+            encoding="utf-8-sig",
+        ).fillna("N/A")
+
+        chaves = set(
+            zip(
+                df_chaves["Processo"].astype(str),
+                df_chaves[
+                    "codigoCentralCapturaProcesso"
+                ].astype(str),
+            )
+        )
+        del df_chaves
+        return chaves
+    except Exception:
+        return set()
+
+
+def gerar_caminho_resultado(caminho_checkpoint):
+    nome = os.path.basename(caminho_checkpoint).replace(
+        "checkpoint_projuris_",
+        "consulta_projuris_",
+    )
+    return os.path.join("/tmp", nome)
+
+
+def finalizar_resultado_csv(
+    caminho_checkpoint,
+    caminho_resultado,
+    processos_filtrados,
+):
+    df_final = pd.read_csv(
+        caminho_checkpoint,
+        dtype=str,
+        encoding="utf-8-sig",
+    )
+    df_final = normalizar_dataframe_resultados(df_final)
+
+    df_final = df_final.drop_duplicates(
+        subset=[
+            "Processo",
+            "codigoCentralCapturaProcesso",
+        ],
+        keep="last",
+    )
+
+    ordem = {
+        (
+            str(processo.get("Processo", "N/A")),
+            str(processo.get("id_central", "N/A")),
+        ): indice
+        for indice, processo in enumerate(processos_filtrados)
+    }
+
+    df_final["_ordem"] = [
+        ordem.get(
+            (str(processo), str(codigo)),
+            len(ordem),
+        )
+        for processo, codigo in zip(
+            df_final["Processo"],
+            df_final["codigoCentralCapturaProcesso"],
+        )
+    ]
+
+    df_final = (
+        df_final.sort_values("_ordem", na_position="last")
+        .drop(columns=["_ordem"])
+        .reset_index(drop=True)
+    )
+
+    df_final.to_csv(
+        caminho_resultado,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    total = len(df_final)
+    del df_final
+    gc.collect()
+
+    return total
+
+
 def consultar_capturas_completas(
     token_user_raw,
     cd_arrendatario,
@@ -1112,14 +1260,15 @@ def consultar_capturas_completas(
     retomar_checkpoint,
     status_box,
 ):
-    sessao_principal = criar_sessao_http()
-    token_limpo = token_user_raw.strip()
+    """
+    Consulta Projuris e Broly mantendo em RAM somente:
+    - os dados mínimos de cada captura;
+    - um lote pequeno de respostas do Broly.
 
-    token_final = (
-        token_limpo
-        if token_limpo.lower().startswith("bearer ")
-        else f"Bearer {token_limpo}"
-    )
+    Os resultados do Broly são gravados incrementalmente em /tmp.
+    """
+    token_limpo = normalizar_token_usuario(token_user_raw)
+    token_final = f"Bearer {token_limpo}"
 
     headers = {
         "Authorization": token_final,
@@ -1135,6 +1284,20 @@ def consultar_capturas_completas(
         ambito,
         tribunal_sigla,
     )
+    caminho_resultado = gerar_caminho_resultado(
+        caminho_checkpoint
+    )
+
+    if not retomar_checkpoint:
+        for caminho in (
+            caminho_checkpoint,
+            caminho_resultado,
+        ):
+            if os.path.exists(caminho):
+                try:
+                    os.remove(caminho)
+                except OSError:
+                    pass
 
     filtro_api = MAPA_FILTROS.get(status_usuario)
     filtros_api_lista = (
@@ -1143,136 +1306,152 @@ def consultar_capturas_completas(
         else [filtro_api]
     )
 
-    dados_brutos = []
+    # Em vez de guardar o JSON bruto de todas as páginas, guardamos somente
+    # três campos por captura.
+    processos_unicos = {}
+    sessao_principal = criar_sessao_http()
 
-    for filtro_atual in filtros_api_lista:
-        st.write("🛰️ Consultando registros no Projuris ADV...")
-
-        pagina = 0
-        total_coletado_filtro = 0
-        total_registros_filtro = None
-
-        while True:
-            resposta = consultar_pagina_projuris(
-                sessao_principal,
-                headers,
-                filtro_atual,
-                pagina,
+    try:
+        for filtro_atual in filtros_api_lista:
+            st.write(
+                "🛰️ Consultando registros no Projuris ADV..."
             )
 
-            if resposta.status_code != 200:
-                if resposta.status_code == 412:
+            pagina = 0
+            total_coletado_filtro = 0
+            total_registros_filtro = None
+
+            while True:
+                resposta = consultar_pagina_projuris(
+                    sessao_principal,
+                    headers,
+                    filtro_atual,
+                    pagina,
+                )
+
+                if resposta.status_code != 200:
+                    if resposta.status_code == 412:
+                        raise RuntimeError(
+                            "Erro 412: verifique o Arrendatário "
+                            "ou o Token."
+                        )
+
                     raise RuntimeError(
-                        "Erro 412: verifique o Arrendatário ou o Token."
+                        f"Erro HTTP {resposta.status_code} "
+                        f"na página {pagina}. "
+                        f"Resposta: {resposta.text[:500]}"
                     )
 
-                raise RuntimeError(
-                    f"Erro HTTP {resposta.status_code} na página {pagina}. "
-                    f"Resposta: {resposta.text[:500]}"
+                try:
+                    data = resposta.json()
+                except ValueError as erro:
+                    raise RuntimeError(
+                        f"A página {pagina} retornou uma "
+                        "resposta JSON inválida."
+                    ) from erro
+
+                itens = data.get(
+                    "centralCapturaProcessoConsultaResultadoWs",
+                    [],
                 )
 
-            try:
-                data = resposta.json()
-            except ValueError as erro:
-                raise RuntimeError(
-                    f"A página {pagina} retornou uma resposta JSON inválida."
-                ) from erro
+                if not itens:
+                    del data, resposta
+                    break
 
-            itens = data.get(
-                "centralCapturaProcessoConsultaResultadoWs",
-                [],
-            )
+                for item in itens:
+                    numero_processo = extrair_numero_processo(
+                        item
+                    )
 
-            if not itens:
-                break
+                    if not processo_corresponde_ao_filtro(
+                        numero_processo,
+                        ambito,
+                        tribunal_sigla,
+                    ):
+                        continue
 
-            dados_brutos.extend(itens)
-            total_coletado_filtro += len(itens)
-            total_registros_filtro = data.get(
-                "totalRegistros",
-                total_registros_filtro,
-            )
+                    id_central = item.get(
+                        "codigoCentralCapturaProcesso"
+                    )
 
-            if total_registros_filtro is not None:
-                st.write(
-                    f"📥 {total_coletado_filtro} de "
-                    f"{total_registros_filtro} registros coletados."
+                    processo = {
+                        "Processo": numero_processo,
+                        "Tribunal": identificar_tribunal(
+                            numero_processo,
+                            item.get("tribunal"),
+                        ),
+                        "id_central": id_central,
+                    }
+
+                    chave = (
+                        str(numero_processo or "N/A"),
+                        str(id_central or "N/A"),
+                    )
+                    processos_unicos[chave] = processo
+
+                total_coletado_filtro += len(itens)
+                total_registros_filtro = data.get(
+                    "totalRegistros",
+                    total_registros_filtro,
                 )
-            else:
-                st.write(
-                    f"📥 {total_coletado_filtro} registros coletados."
+
+                if total_registros_filtro is not None:
+                    st.write(
+                        f"📥 {total_coletado_filtro} de "
+                        f"{total_registros_filtro} "
+                        "registros analisados."
+                    )
+                else:
+                    st.write(
+                        f"📥 {total_coletado_filtro} "
+                        "registros analisados."
+                    )
+
+                terminou = (
+                    (
+                        total_registros_filtro is not None
+                        and total_coletado_filtro
+                        >= total_registros_filtro
+                    )
+                    or len(itens) < QUANTIDADE_POR_PAGINA
                 )
 
-            if (
-                total_registros_filtro is not None
-                and total_coletado_filtro >= total_registros_filtro
-            ):
-                break
+                # Libera imediatamente a página bruta da API.
+                del itens, data, resposta
+                gc.collect()
 
-            if len(itens) < QUANTIDADE_POR_PAGINA:
-                break
+                if terminou:
+                    break
 
-            pagina += 1
-            time.sleep(PAUSA_ENTRE_PAGINAS)
-
-    if not dados_brutos:
-        raise RuntimeError("Nenhum registro foi retornado pela API.")
-
-    processos_filtrados = []
-
-    for item in dados_brutos:
-        numero_processo = extrair_numero_processo(item)
-
-        if processo_corresponde_ao_filtro(
-            numero_processo,
-            ambito,
-            tribunal_sigla,
-        ):
-            processos_filtrados.append({
-                "Processo": numero_processo,
-                "Tribunal": identificar_tribunal(
-                    numero_processo,
-                    item.get("tribunal"),
-                ),
-                "id_central": item.get(
-                    "codigoCentralCapturaProcesso"
-                ),
-            })
-
-    processos_unicos = {}
-
-    for processo in processos_filtrados:
-        # Um mesmo número de processo pode possuir mais de uma captura.
-        # A identidade correta de cada captura é o codigoCentralCapturaProcesso.
-        chave = (
-            str(processo.get("id_central") or "N/A"),
-            str(processo.get("Processo") or "N/A"),
-        )
-        if chave not in processos_unicos:
-            processos_unicos[chave] = processo
+                pagina += 1
+                time.sleep(PAUSA_ENTRE_PAGINAS)
+    finally:
+        try:
+            sessao_principal.close()
+        except Exception:
+            pass
 
     processos_filtrados = list(processos_unicos.values())
+    del processos_unicos
+    gc.collect()
 
     if not processos_filtrados:
         raise RuntimeError(
-            "Nenhum processo encontrado com os filtros selecionados."
+            "Nenhum processo encontrado com os filtros "
+            "selecionados."
         )
 
     total_processos = len(processos_filtrados)
-    st.write(f"🔍 {total_processos} capturas encontradas.")
+    st.write(
+        f"🔍 {total_processos} capturas encontradas."
+    )
 
-    resultados_finais = []
-
-    if retomar_checkpoint:
-        resultados_finais = carregar_checkpoint(caminho_checkpoint)
-
-    capturas_ja_concluidas = {
-        (
-            str(resultado.get("Processo", "N/A")),
-            str(resultado.get("codigoCentralCapturaProcesso", "N/A")),
-        )
-        for resultado in resultados_finais
-    }
+    capturas_ja_concluidas = (
+        carregar_chaves_concluidas(caminho_checkpoint)
+        if retomar_checkpoint
+        else set()
+    )
 
     processos_pendentes = [
         processo
@@ -1283,28 +1462,32 @@ def consultar_capturas_completas(
         ) not in capturas_ja_concluidas
     ]
 
-    quantidade_recuperada = len(capturas_ja_concluidas)
+    quantidade_recuperada = len(
+        capturas_ja_concluidas
+    )
 
-    if quantidade_recuperada > 0:
+    if quantidade_recuperada:
         st.info(
-            f"♻️ {quantidade_recuperada} resultados recuperados "
-            "da execução anterior."
+            f"♻️ {quantidade_recuperada} capturas "
+            "recuperadas da consulta anterior."
         )
+
+    del capturas_ja_concluidas
+    gc.collect()
 
     total_pendentes = len(processos_pendentes)
 
-    st.write(
-        f"⚡ Consultando o Broly para {total_pendentes} processos."
-    )
-
     aviso_consultas = st.info(
         f"🔄 Até {MAX_THREADS} consultas simultâneas ao Broly, "
-        f"processadas em lotes de até {TAMANHO_LOTE_BROLY}. "
-        "Isso reduz o consumo de memória e aumenta a estabilidade."
+        f"em lotes de {TAMANHO_LOTE_BROLY}. "
+        "Cada lote é salvo no disco e liberado da memória."
     )
 
     progress_bar = st.progress(
-        min(quantidade_recuperada / total_processos, 1.0)
+        min(
+            quantidade_recuperada / total_processos,
+            1.0,
+        )
     )
     texto_progresso = st.empty()
     texto_estimativa = st.empty()
@@ -1313,136 +1496,138 @@ def consultar_capturas_completas(
     concluidos_nesta_execucao = 0
 
     try:
-        if processos_pendentes:
-            for inicio_lote in range(0, total_pendentes, TAMANHO_LOTE_BROLY):
-                lote = processos_pendentes[
-                    inicio_lote:inicio_lote + TAMANHO_LOTE_BROLY
-                ]
+        for inicio_lote in range(
+            0,
+            total_pendentes,
+            TAMANHO_LOTE_BROLY,
+        ):
+            lote = processos_pendentes[
+                inicio_lote:
+                inicio_lote + TAMANHO_LOTE_BROLY
+            ]
+            resultados_lote = []
 
-                with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-                    futures = {
-                        executor.submit(
-                            consultar_processo,
-                            processo,
-                            cd_arrendatario,
-                        ): processo
-                        for processo in lote
-                    }
+            with ThreadPoolExecutor(
+                max_workers=MAX_THREADS
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        consultar_processo,
+                        processo,
+                        cd_arrendatario,
+                    ): processo
+                    for processo in lote
+                }
 
-                    for future in as_completed(futures):
-                        processo_original = futures[future]
+                for future in as_completed(futures):
+                    processo_original = futures[future]
 
-                        try:
-                            resultado = future.result()
-                        except Exception as erro:
-                            id_central = processo_original.get("id_central")
-                            resultado = {
-                                "Processo": processo_original["Processo"],
-                                "codigoCentralCapturaProcesso": str(
-                                    id_central or "N/A"
-                                ),
-                                "Tribunal": processo_original["Tribunal"],
-                                "ID Demanda": "N/A",
-                                "Status": (
-                                    "ERRO INESPERADO NA THREAD: "
-                                    f"{erro}"
-                                ),
-                                "Fornecedor": "N/A",
-                                "Link": (
-                                    montar_link_completo(
-                                        cd_arrendatario,
-                                        id_central,
-                                    )
-                                    if id_central
-                                    else "N/A"
-                                ),
-                            }
-
-                        resultados_finais.append(resultado)
-                        concluidos_nesta_execucao += 1
-                        total_concluido = (
-                            quantidade_recuperada
-                            + concluidos_nesta_execucao
+                    try:
+                        resultado = future.result()
+                    except Exception as erro:
+                        id_central = processo_original.get(
+                            "id_central"
                         )
+                        resultado = {
+                            "Processo": processo_original[
+                                "Processo"
+                            ],
+                            "codigoCentralCapturaProcesso": str(
+                                id_central or "N/A"
+                            ),
+                            "Tribunal": processo_original[
+                                "Tribunal"
+                            ],
+                            "ID Demanda": "N/A",
+                            "Status": (
+                                "ERRO INESPERADO NA THREAD: "
+                                f"{erro}"
+                            ),
+                            "Fornecedor": "N/A",
+                            "Link": (
+                                montar_link_completo(
+                                    cd_arrendatario,
+                                    id_central,
+                                )
+                                if id_central
+                                else "N/A"
+                            ),
+                        }
 
-                        progress_bar.progress(
-                            min(total_concluido / total_processos, 1.0)
+                    resultados_lote.append(resultado)
+                    concluidos_nesta_execucao += 1
+
+                    total_concluido = (
+                        quantidade_recuperada
+                        + concluidos_nesta_execucao
+                    )
+                    progress_bar.progress(
+                        min(
+                            total_concluido
+                            / total_processos,
+                            1.0,
                         )
+                    )
 
-                        tempo_decorrido = time.monotonic() - inicio
-                        media = tempo_decorrido / concluidos_nesta_execucao
+                    if concluidos_nesta_execucao:
+                        tempo_decorrido = (
+                            time.monotonic() - inicio
+                        )
+                        media = (
+                            tempo_decorrido
+                            / concluidos_nesta_execucao
+                        )
                         restantes = (
-                            total_pendentes - concluidos_nesta_execucao
+                            total_pendentes
+                            - concluidos_nesta_execucao
                         )
                         estimativa = media * restantes
-                        minutos = int(estimativa // 60)
-                        segundos = int(estimativa % 60)
 
                         texto_progresso.write(
-                            f"✅ {total_concluido} de {total_processos} "
-                            "processos consultados."
+                            f"✅ {total_concluido} de "
+                            f"{total_processos} "
+                            "capturas consultadas."
                         )
                         texto_estimativa.caption(
                             f"Restantes: {restantes} | "
-                            f"Estimativa aproximada: {minutos} min "
-                            f"{segundos} s"
+                            "Estimativa aproximada: "
+                            f"{int(estimativa // 60)} min "
+                            f"{int(estimativa % 60)} s"
                         )
 
-                        if (
-                            concluidos_nesta_execucao
-                            % INTERVALO_CHECKPOINT
-                            == 0
-                        ):
-                            salvar_checkpoint(
-                                resultados_finais,
-                                caminho_checkpoint,
-                            )
+            # O lote inteiro vai ao disco de uma vez.
+            anexar_resultados_csv(
+                resultados_lote,
+                caminho_checkpoint,
+            )
 
-                # Fecha as conexões mantidas pelas threads do lote e solicita
-                # a liberação de objetos temporários antes do próximo lote.
-                if hasattr(_thread_local, "sessao"):
-                    try:
-                        _thread_local.sessao.close()
-                    except Exception:
-                        pass
-                    try:
-                        delattr(_thread_local, "sessao")
-                    except AttributeError:
-                        pass
+            del resultados_lote, futures, lote
+            gc.collect()
 
-                salvar_checkpoint(resultados_finais, caminho_checkpoint)
-                gc.collect()
+        if not os.path.exists(caminho_checkpoint):
+            raise RuntimeError(
+                "A consulta terminou sem gerar resultados."
+            )
 
-        salvar_checkpoint(resultados_finais, caminho_checkpoint)
+        total_final = finalizar_resultado_csv(
+            caminho_checkpoint,
+            caminho_resultado,
+            processos_filtrados,
+        )
 
-    except Exception:
-        if resultados_finais:
-            salvar_checkpoint(resultados_finais, caminho_checkpoint)
-        raise
+        status_box.update(
+            label="✅ Consulta concluída!",
+            state="complete",
+        )
+
+        return caminho_resultado, total_final
 
     finally:
         aviso_consultas.empty()
         texto_progresso.empty()
         texto_estimativa.empty()
-
-    df_final = preparar_dataframe_consulta(
-        resultados_finais,
-        processos_filtrados,
-    )
-
-    if os.path.exists(caminho_checkpoint):
-        try:
-            os.remove(caminho_checkpoint)
-        except OSError:
-            pass
-
-    status_box.update(
-        label="✅ Consulta concluída!",
-        state="complete",
-    )
-
-    return df_final
-
+        del processos_pendentes
+        gc.collect()
 
 def gerar_excel_unico(df_final):
     return gerar_excel_tribunal(df_final)
@@ -1576,11 +1761,12 @@ st.set_page_config(
 st.title("📂 Consulta e Extração de Capturas - Projuris ADV")
 st.caption(
     "Primeiro consulte as capturas e analise a distribuição. "
-    "Depois aplique os filtros e gere os arquivos desejados. "
+    "Depois aplique os filtros e gere os arquivos sem consultar "
+    "o Broly novamente."
 )
 
 for chave, valor_padrao in {
-    "dados_consulta": None,
+    "caminho_consulta": None,
     "parametros_consulta": None,
 }.items():
     if chave not in st.session_state:
@@ -1624,8 +1810,8 @@ with st.sidebar:
         "Retomar consulta interrompida",
         value=True,
         help=(
-            "Reaproveita resultados já consultados caso uma "
-            "execução anterior tenha sido interrompida."
+            "Reaproveita lotes já gravados em disco "
+            "se uma execução anterior for interrompida."
         ),
     )
 
@@ -1638,12 +1824,25 @@ with st.sidebar:
     limpar_consulta = st.button(
         "🧹 Limpar consulta atual",
         width="stretch",
-        disabled=st.session_state["dados_consulta"] is None,
+        disabled=(
+            st.session_state["caminho_consulta"]
+            is None
+        ),
     )
 
 if limpar_consulta:
-    st.session_state["dados_consulta"] = None
+    caminho_antigo = st.session_state.get(
+        "caminho_consulta"
+    )
+    if caminho_antigo and os.path.exists(caminho_antigo):
+        try:
+            os.remove(caminho_antigo)
+        except OSError:
+            pass
+
+    st.session_state["caminho_consulta"] = None
     st.session_state["parametros_consulta"] = None
+    gc.collect()
     st.rerun()
 
 if consultar:
@@ -1657,7 +1856,10 @@ if consultar:
             expanded=True,
         ) as status_box:
             try:
-                df_consulta = consultar_capturas_completas(
+                (
+                    caminho_consulta,
+                    total_consulta,
+                ) = consultar_capturas_completas(
                     token_user_raw=token_user_raw,
                     cd_arrendatario=cd_arrendatario,
                     status_usuario=status_usuario,
@@ -1667,8 +1869,12 @@ if consultar:
                     status_box=status_box,
                 )
 
-                st.session_state["dados_consulta"] = df_consulta
-                st.session_state["parametros_consulta"] = {
+                st.session_state[
+                    "caminho_consulta"
+                ] = caminho_consulta
+                st.session_state[
+                    "parametros_consulta"
+                ] = {
                     "cd_arrendatario": cd_arrendatario,
                     "status_usuario": status_usuario,
                     "ambito": ambito,
@@ -1676,9 +1882,11 @@ if consultar:
                 }
 
                 st.success(
-                    "Consulta concluída. Os dados ficaram armazenados "
-                    "nesta sessão para que você possa aplicar vários "
-                    "filtros e gerar arquivos sem consultar novamente."
+                    f"Consulta concluída com "
+                    f"{total_consulta:,} capturas. "
+                    "Os resultados ficaram em arquivo temporário, "
+                    "sem manter o DataFrame inteiro no session_state."
+                    .replace(",", ".")
                 )
 
             except Exception as erro:
@@ -1688,20 +1896,43 @@ if consultar:
                 )
                 st.error(f"Erro: {erro}")
                 st.info(
-                    "Caso existam resultados já processados, eles foram "
-                    "preservados para uma nova tentativa."
+                    "Os lotes já concluídos permanecem no "
+                    "checkpoint para uma nova tentativa."
                 )
 
-if st.session_state["dados_consulta"] is None:
+caminho_consulta = st.session_state.get(
+    "caminho_consulta"
+)
+
+if (
+    not caminho_consulta
+    or not os.path.exists(caminho_consulta)
+):
+    if caminho_consulta:
+        # A instância do Streamlit pode ter reiniciado e apagado /tmp.
+        st.session_state["caminho_consulta"] = None
+        st.session_state["parametros_consulta"] = None
+
     st.info(
         "Preencha os filtros na barra lateral e clique em "
         "'Consultar capturas'."
     )
     st.stop()
 
+# O DataFrame existe apenas durante este rerun. Ele não fica preso ao
+# session_state entre interações.
+df_consulta = pd.read_csv(
+    caminho_consulta,
+    dtype=str,
+    encoding="utf-8-sig",
+).fillna("N/A")
 
-df_consulta = st.session_state["dados_consulta"]
-parametros = st.session_state["parametros_consulta"]
+df_consulta = normalizar_dataframe_resultados(
+    df_consulta
+)
+parametros = st.session_state[
+    "parametros_consulta"
+]
 
 st.divider()
 st.subheader("📊 Resumo da consulta")
