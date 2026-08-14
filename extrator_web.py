@@ -1477,11 +1477,9 @@ def consultar_capturas_completas(
 
     total_pendentes = len(processos_pendentes)
 
-    aviso_consultas = st.info(
-        f"🔄 Até {MAX_THREADS} consultas simultâneas ao Broly, "
-        f"em lotes de {TAMANHO_LOTE_BROLY}. "
-        "Cada lote é salvo no disco e liberado da memória."
-    )
+    # A consulta ao Broly é processada em lotes e com concorrência
+    # controlada para manter o app estável no Streamlit Cloud.
+    aviso_consultas = None
 
     progress_bar = st.progress(
         min(
@@ -1623,7 +1621,8 @@ def consultar_capturas_completas(
         return caminho_resultado, total_final
 
     finally:
-        aviso_consultas.empty()
+        if aviso_consultas is not None:
+            aviso_consultas.empty()
         texto_progresso.empty()
         texto_estimativa.empty()
         del processos_pendentes
@@ -1881,11 +1880,10 @@ if consultar:
                 }
 
                 st.success(
-                    f"Consulta concluída com "
-                    f"{total_consulta:,} capturas. "
-                    "Os resultados ficaram em arquivo temporário, "
-                    "sem manter o DataFrame inteiro no session_state."
-                    .replace(",", ".")
+                    (
+                        f"Consulta concluída com "
+                        f"{total_consulta:,} capturas."
+                    ).replace(",", ".")
                 )
 
             except Exception as erro:
@@ -2013,6 +2011,7 @@ st.divider()
 st.subheader("🎯 Filtros para extração")
 st.caption(
     "Estes filtros são aplicados aos dados já consultados. "
+    "Alterá-los não faz novas requisições ao Projuris ou ao Broly."
 )
 
 opcoes_fornecedor_labels, mapa_fornecedor = criar_opcoes_com_quantidade(
@@ -2126,6 +2125,7 @@ else:
 
     st.caption(
         "O arquivo só será montado ao clicar no botão abaixo. "
+        "Assim, trocar filtros não recria Excel ou ZIP automaticamente."
     )
 
     preparar_arquivo = st.button(
