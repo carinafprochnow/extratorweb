@@ -1760,8 +1760,7 @@ st.set_page_config(
 st.title("📂 Consulta e Extração de Capturas - Projuris ADV")
 st.caption(
     "Primeiro consulte as capturas e analise a distribuição. "
-    "Depois aplique os filtros e gere os arquivos sem consultar "
-    "o Broly novamente."
+    "Depois aplique os filtros e gere os arquivos desejados."
 )
 
 for chave, valor_padrao in {
