@@ -34,9 +34,9 @@ MAX_TENTATIVAS_DEMANDA = 4
 MAX_THREADS = 3
 INTERVALO_CHECKPOINT = 25
 TAMANHO_LOTE_BROLY = 50
-LIMITE_PREVIA = 50
+LIMITE_PREVIA = 30
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v10_disk_streaming"
+VERSAO_CHECKPOINT = "v11_sem_dashboard"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -1935,7 +1935,7 @@ parametros = st.session_state[
 ]
 
 st.divider()
-st.subheader("📊 Resumo da consulta")
+st.subheader("📋 Resumo da consulta")
 
 if parametros:
     st.caption(
@@ -1946,146 +1946,74 @@ if parametros:
     )
 
 total_processos = len(df_consulta)
-total_com_id = (
-    df_consulta["ID Demanda"].astype(str).str.strip().ne("N/A").sum()
+
+total_com_id = int(
+    df_consulta["ID Demanda"]
+    .astype(str)
+    .str.strip()
+    .ne("N/A")
+    .sum()
 )
 total_sem_id = total_processos - total_com_id
-total_fornecedores = (
-    df_consulta.loc[
-        df_consulta["Fornecedor"].astype(str).str.strip().ne("N/A"),
-        "Fornecedor",
-    ].nunique()
+
+st.success(
+    f"Foram encontradas {total_processos:,} capturas "
+    "com os filtros selecionados."
+    .replace(",", ".")
 )
-total_tribunais = df_consulta["Tribunal"].nunique()
 
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("Processos", f"{total_processos:,}".replace(",", "."))
-col2.metric("Com ID Demanda", f"{total_com_id:,}".replace(",", "."))
-col3.metric("Sem ID Demanda", f"{total_sem_id:,}".replace(",", "."))
-col4.metric("Fornecedores", total_fornecedores)
-col5.metric("Tribunais", total_tribunais)
+# Resumo simples por fornecedor. Não cria gráficos, tabs,
+# tabelas de dashboard ou cruzamentos pesados.
+contagem_fornecedor = (
+    df_consulta["Fornecedor"]
+    .fillna("N/A")
+    .astype(str)
+    .str.strip()
+    .replace("", "N/A")
+    .value_counts(dropna=False)
+)
 
-aba_fornecedor, aba_status, aba_tribunal, aba_cruzamento = st.tabs([
-    "Fornecedores",
-    "Status do Broly",
-    "Tribunais",
-    "Fornecedor x Status",
-])
+if not contagem_fornecedor.empty:
+    st.markdown("**Distribuição por fornecedor:**")
 
-with aba_fornecedor:
-    resumo_fornecedor = (
-        df_consulta.groupby(
-            ["Fornecedor"],
-            dropna=False,
+    for fornecedor, quantidade in contagem_fornecedor.items():
+        fornecedor_exibicao = (
+            "Fornecedor não identificado"
+            if str(fornecedor).strip() == "N/A"
+            else str(fornecedor).strip()
         )
-        .size()
-        .reset_index(name="Quantidade")
-        .sort_values("Quantidade", ascending=False)
-    )
-    resumo_fornecedor["Percentual"] = (
-        resumo_fornecedor["Quantidade"] / total_processos * 100
-    ).map(lambda valor: f"{valor:.1f}%".replace(".", ","))
-    st.dataframe(
-        resumo_fornecedor,
-        width="stretch",
-        hide_index=True,
-    )
-    st.bar_chart(
-        resumo_fornecedor.set_index("Fornecedor")["Quantidade"]
-    )
 
-with aba_status:
-    resumo_status = (
-        df_consulta.groupby("Status", dropna=False)
-        .size()
-        .reset_index(name="Quantidade")
-        .sort_values("Quantidade", ascending=False)
-    )
-    resumo_status["Percentual"] = (
-        resumo_status["Quantidade"] / total_processos * 100
-    ).map(lambda valor: f"{valor:.1f}%".replace(".", ","))
-    st.dataframe(
-        resumo_status,
-        width="stretch",
-        hide_index=True,
-    )
-    st.bar_chart(
-        resumo_status.set_index("Status")["Quantidade"]
-    )
+        percentual = (
+            (int(quantidade) / total_processos * 100)
+            if total_processos
+            else 0
+        )
 
-with aba_tribunal:
-    resumo_tribunal = (
-        df_consulta.groupby("Tribunal", dropna=False)
-        .size()
-        .reset_index(name="Quantidade")
-        .sort_values("Quantidade", ascending=False)
-    )
-    resumo_tribunal["Percentual"] = (
-        resumo_tribunal["Quantidade"] / total_processos * 100
-    ).map(lambda valor: f"{valor:.1f}%".replace(".", ","))
-    st.dataframe(
-        resumo_tribunal,
-        width="stretch",
-        hide_index=True,
-    )
-    st.bar_chart(
-        resumo_tribunal.set_index("Tribunal")["Quantidade"]
-    )
-
-with aba_cruzamento:
-    cruzamento = pd.crosstab(
-        df_consulta["Fornecedor"],
-        df_consulta["Status"],
-        margins=True,
-        margins_name="Total",
-    ).reset_index()
-    st.dataframe(
-        cruzamento,
-        width="stretch",
-        hide_index=True,
-    )
-
-st.subheader("💡 Insights")
-
-contagem_fornecedor = df_consulta["Fornecedor"].value_counts(dropna=False)
-contagem_status = df_consulta["Status"].value_counts(dropna=False)
-contagem_tribunal = df_consulta["Tribunal"].value_counts(dropna=False)
-
-fornecedor_principal = str(contagem_fornecedor.index[0])
-qtd_fornecedor_principal = int(contagem_fornecedor.iloc[0])
-status_principal = str(contagem_status.index[0])
-qtd_status_principal = int(contagem_status.iloc[0])
-tribunal_principal = str(contagem_tribunal.index[0])
-qtd_tribunal_principal = int(contagem_tribunal.iloc[0])
-
-percentual_fornecedor = qtd_fornecedor_principal / total_processos * 100
-percentual_status = qtd_status_principal / total_processos * 100
-
-insights = [
-    f"O fornecedor com mais registros é **{fornecedor_principal}**, com "
-    f"**{qtd_fornecedor_principal:,} processos** "
-    f"({percentual_fornecedor:.1f}% do total).".replace(",", "."),
-    f"O status mais frequente é **{status_principal}**, com "
-    f"**{qtd_status_principal:,} processos** "
-    f"({percentual_status:.1f}% do total).".replace(",", "."),
-    f"O tribunal com mais registros é **{tribunal_principal}**, com "
-    f"**{qtd_tribunal_principal:,} processos**.".replace(",", "."),
-]
+        st.write(
+            f"• {fornecedor_exibicao}: "
+            f"{int(quantidade):,} "
+            f"({percentual:.1f}%)"
+            .replace(",", ".")
+        )
 
 if total_sem_id:
-    insights.append(
-        f"Existem **{total_sem_id:,} processos sem ID Demanda**."
+    st.caption(
+        f"{total_sem_id:,} capturas não retornaram ID Demanda."
         .replace(",", ".")
     )
+else:
+    st.caption(
+        "Todas as capturas retornaram ID Demanda."
+    )
 
-for insight in insights:
-    st.markdown(f"- {insight}")
+# Libera o Series de resumo assim que ele deixa de ser necessário.
+del contagem_fornecedor
+gc.collect()
 
 st.divider()
 st.subheader("🎯 Filtros para extração")
 st.caption(
     "Estes filtros são aplicados aos dados já consultados. "
-    "Alterá-los não faz novas requisições ao Projuris ou ao Broly."
 )
 
 opcoes_fornecedor_labels, mapa_fornecedor = criar_opcoes_com_quantidade(
@@ -2147,7 +2075,7 @@ df_filtrado = aplicar_filtros_pos_consulta(
 
 st.info(
     f"O filtro atual selecionou {len(df_filtrado):,} de "
-    f"{len(df_consulta):,} processos."
+    f"{len(df_consulta):,} capturas."
     .replace(",", ".")
 )
 
@@ -2190,7 +2118,7 @@ organizacao = st.radio(
 
 if df_filtrado.empty:
     st.warning(
-        "Nenhum processo corresponde aos filtros atuais. "
+        "Nenhuma captura corresponde aos filtros atuais. "
         "Ajuste os filtros para liberar a geração."
     )
 else:
@@ -2199,7 +2127,6 @@ else:
 
     st.caption(
         "O arquivo só será montado ao clicar no botão abaixo. "
-        "Assim, trocar filtros não recria Excel ou ZIP automaticamente."
     )
 
     preparar_arquivo = st.button(
