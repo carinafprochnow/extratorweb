@@ -36,7 +36,7 @@ INTERVALO_CHECKPOINT = 25
 TAMANHO_LOTE_BROLY = 50
 LIMITE_PREVIA = 30
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v11_sem_dashboard"
+VERSAO_CHECKPOINT = "v12_fornecedor_only"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -1760,7 +1760,8 @@ st.set_page_config(
 st.title("📂 Consulta e Extração de Capturas - Projuris ADV")
 st.caption(
     "Primeiro consulte as capturas e analise a distribuição. "
-    "Depois aplique os filtros e gere os arquivos desejados."
+    "Depois aplique os filtros e gere os arquivos sem consultar "
+    "o Broly novamente."
 )
 
 for chave, valor_padrao in {
@@ -1932,35 +1933,17 @@ parametros = st.session_state[
 ]
 
 st.divider()
-st.subheader("📋 Resumo da consulta")
+st.subheader("📋 Resultado da consulta")
 
-if parametros:
-    st.caption(
-        f"Arrendatário: {parametros['cd_arrendatario']} | "
-        f"Status: {parametros['status_usuario']} | "
-        f"Âmbito: {parametros['ambito']} | "
-        f"Tribunal inicial: {parametros['tribunal_sigla']}"
-    )
-
-total_processos = len(df_consulta)
-
-total_com_id = int(
-    df_consulta["ID Demanda"]
-    .astype(str)
-    .str.strip()
-    .ne("N/A")
-    .sum()
-)
-total_sem_id = total_processos - total_com_id
+total_capturas = len(df_consulta)
 
 st.success(
-    f"Foram encontradas {total_processos:,} capturas "
-    "com os filtros selecionados."
-    .replace(",", ".")
+    (
+        f"Foram encontradas {total_capturas:,} capturas "
+        "com os filtros selecionados."
+    ).replace(",", ".")
 )
 
-# Resumo simples por fornecedor. Não cria gráficos, tabs,
-# tabelas de dashboard ou cruzamentos pesados.
 contagem_fornecedor = (
     df_consulta["Fornecedor"]
     .fillna("N/A")
@@ -1971,7 +1954,7 @@ contagem_fornecedor = (
 )
 
 if not contagem_fornecedor.empty:
-    st.markdown("**Distribuição por fornecedor:**")
+    st.markdown("**Capturas por fornecedor:**")
 
     for fornecedor, quantidade in contagem_fornecedor.items():
         fornecedor_exibicao = (
@@ -1980,125 +1963,62 @@ if not contagem_fornecedor.empty:
             else str(fornecedor).strip()
         )
 
-        percentual = (
-            (int(quantidade) / total_processos * 100)
-            if total_processos
-            else 0
-        )
-
         st.write(
-            f"• {fornecedor_exibicao}: "
-            f"{int(quantidade):,} "
-            f"({percentual:.1f}%)"
-            .replace(",", ".")
+            (
+                f"• {fornecedor_exibicao}: "
+                f"{int(quantidade):,} capturas"
+            ).replace(",", ".")
         )
-
-if total_sem_id:
-    st.caption(
-        f"{total_sem_id:,} capturas não retornaram ID Demanda."
-        .replace(",", ".")
-    )
-else:
-    st.caption(
-        "Todas as capturas retornaram ID Demanda."
-    )
-
-# Libera o Series de resumo assim que ele deixa de ser necessário.
-del contagem_fornecedor
-gc.collect()
 
 st.divider()
-st.subheader("🎯 Filtros para extração")
-st.caption(
-    "Estes filtros são aplicados aos dados já consultados. "
-    "Alterá-los não faz novas requisições ao Projuris ou ao Broly."
-)
+st.subheader("🎯 Filtrar por fornecedor")
 
-opcoes_fornecedor_labels, mapa_fornecedor = criar_opcoes_com_quantidade(
-    df_consulta, "Fornecedor"
-)
-opcoes_status_labels, mapa_status = criar_opcoes_com_quantidade(
-    df_consulta, "Status"
-)
-opcoes_tribunal_labels, mapa_tribunal = criar_opcoes_com_quantidade(
-    df_consulta, "Tribunal"
-)
-
-f1, f2, f3 = st.columns(3)
-
-with f1:
-    fornecedores_labels = st.multiselect(
+opcoes_fornecedor_labels, mapa_fornecedor = (
+    criar_opcoes_com_quantidade(
+        df_consulta,
         "Fornecedor",
-        options=opcoes_fornecedor_labels,
-        default=opcoes_fornecedor_labels,
-        help="Valores exatos retornados pela tag <provedor> do Broly.",
     )
+)
 
-with f2:
-    status_labels = st.multiselect(
-        "Status retornado pelo Broly",
-        options=opcoes_status_labels,
-        default=opcoes_status_labels,
-    )
-
-with f3:
-    tribunais_labels = st.multiselect(
-        "Tribunal",
-        options=opcoes_tribunal_labels,
-        default=opcoes_tribunal_labels,
-    )
+fornecedores_labels = st.multiselect(
+    "Fornecedor",
+    options=opcoes_fornecedor_labels,
+    default=opcoes_fornecedor_labels,
+    help=(
+        "Selecione um ou mais fornecedores. "
+        "Se todos permanecerem selecionados, "
+        "o arquivo incluirá toda a consulta."
+    ),
+)
 
 fornecedores_selecionados = [
-    mapa_fornecedor[label] for label in fornecedores_labels
-]
-status_selecionados = [
-    mapa_status[label] for label in status_labels
-]
-tribunais_selecionados = [
-    mapa_tribunal[label] for label in tribunais_labels
+    mapa_fornecedor[label]
+    for label in fornecedores_labels
 ]
 
-somente_com_id = st.checkbox(
-    "Incluir somente registros com ID Demanda",
-    value=False,
-)
-
-df_filtrado = aplicar_filtros_pos_consulta(
-    df=df_consulta,
-    fornecedores=fornecedores_selecionados,
-    status_broly=status_selecionados,
-    tribunais=tribunais_selecionados,
-    somente_com_id=somente_com_id,
-)
+if fornecedores_selecionados:
+    df_filtrado = df_consulta[
+        df_consulta["Fornecedor"]
+        .astype(str)
+        .isin(
+            [
+                str(valor)
+                for valor in fornecedores_selecionados
+            ]
+        )
+    ].copy()
+else:
+    df_filtrado = df_consulta.iloc[0:0].copy()
 
 st.info(
-    f"O filtro atual selecionou {len(df_filtrado):,} de "
-    f"{len(df_consulta):,} capturas."
-    .replace(",", ".")
+    (
+        f"Serão incluídas {len(df_filtrado):,} de "
+        f"{len(df_consulta):,} capturas."
+    ).replace(",", ".")
 )
 
-st.subheader("👀 Prévia dos resultados")
-st.dataframe(
-    df_filtrado[
-        [
-            "Processo",
-            "codigoCentralCapturaProcesso",
-            "Tribunal",
-            "ID Demanda",
-            "Status",
-            "Fornecedor",
-            "Link",
-        ]
-    ].head(LIMITE_PREVIA),
-    width="stretch",
-    hide_index=True,
-)
-
-if len(df_filtrado) > LIMITE_PREVIA:
-    st.caption(
-        f"A prévia mostra as primeiras {LIMITE_PREVIA} linhas. "
-        "O arquivo incluirá todos os registros selecionados."
-    )
+del contagem_fornecedor
+gc.collect()
 
 st.divider()
 st.subheader("📦 Gerar arquivos")
@@ -2107,26 +2027,21 @@ organizacao = st.radio(
     "Organização dos arquivos",
     options=[
         "Excel único",
-        "Separar por tribunal",
         "Separar por fornecedor",
+        "Separar por tribunal",
         "Separar por fornecedor e tribunal",
     ],
-    horizontal=True,
+    horizontal=False,
 )
 
 if df_filtrado.empty:
     st.warning(
-        "Nenhuma captura corresponde aos filtros atuais. "
-        "Ajuste os filtros para liberar a geração."
+        "Nenhuma captura foi selecionada. "
+        "Escolha pelo menos um fornecedor."
     )
 else:
     status_nome = parametros["status_usuario"]
     arrendatario_nome = parametros["cd_arrendatario"]
-
-    st.caption(
-        "O arquivo só será montado ao clicar no botão abaixo. "
-        "Assim, trocar filtros não recria Excel ou ZIP automaticamente."
-    )
 
     preparar_arquivo = st.button(
         "⚙️ Preparar arquivo para download",
@@ -2137,63 +2052,98 @@ else:
     if preparar_arquivo:
         with st.spinner("Gerando arquivo..."):
             if organizacao == "Excel único":
-                arquivo_saida = gerar_excel_unico(df_filtrado)
+                arquivo_saida = gerar_excel_unico(
+                    df_filtrado
+                )
 
                 tribunais_no_arquivo = sorted(
                     {
                         str(tribunal).strip()
-                        for tribunal in df_filtrado["Tribunal"].dropna().tolist()
+                        for tribunal in (
+                            df_filtrado["Tribunal"]
+                            .dropna()
+                            .tolist()
+                        )
                         if str(tribunal).strip()
                     }
                 )
 
                 if len(tribunais_no_arquivo) == 1:
-                    identificador_tribunal = tribunais_no_arquivo[0]
+                    identificador_tribunal = (
+                        tribunais_no_arquivo[0]
+                    )
                 elif len(tribunais_no_arquivo) == 2:
-                    identificador_tribunal = " + ".join(tribunais_no_arquivo)
+                    identificador_tribunal = " + ".join(
+                        tribunais_no_arquivo
+                    )
                 elif len(tribunais_no_arquivo) > 2:
-                    identificador_tribunal = "MULTIPLOS TRIBUNAIS"
+                    identificador_tribunal = (
+                        "MULTIPLOS TRIBUNAIS"
+                    )
                 else:
-                    identificador_tribunal = "TRIBUNAL NAO IDENTIFICADO"
+                    identificador_tribunal = (
+                        "TRIBUNAL NAO IDENTIFICADO"
+                    )
 
                 nome_arquivo = limpar_nome_arquivo(
-                    f"{status_nome} - {identificador_tribunal} - "
+                    f"{status_nome} - "
+                    f"{identificador_tribunal} - "
                     f"{arrendatario_nome}.xlsx"
                 )
+
                 mime = (
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
+                    "application/vnd.openxmlformats-"
+                    "officedocument.spreadsheetml.sheet"
                 )
-            elif organizacao == "Separar por tribunal":
+
+            elif (
+                organizacao
+                == "Separar por fornecedor"
+            ):
+                arquivo_saida = (
+                    gerar_zip_por_fornecedor(
+                        df_filtrado,
+                        status_nome,
+                        arrendatario_nome,
+                    )
+                )
+
+                nome_arquivo = limpar_nome_arquivo(
+                    f"{status_nome} - "
+                    "POR FORNECEDOR - "
+                    f"{arrendatario_nome}.zip"
+                )
+                mime = "application/zip"
+
+            elif (
+                organizacao
+                == "Separar por tribunal"
+            ):
                 arquivo_saida = gerar_zip_por_tribunal(
                     df_filtrado,
                     status_nome,
                     arrendatario_nome,
                 )
+
                 nome_arquivo = limpar_nome_arquivo(
-                    f"{status_nome} - POR TRIBUNAL - "
+                    f"{status_nome} - "
+                    "POR TRIBUNAL - "
                     f"{arrendatario_nome}.zip"
                 )
                 mime = "application/zip"
-            elif organizacao == "Separar por fornecedor":
-                arquivo_saida = gerar_zip_por_fornecedor(
-                    df_filtrado,
-                    status_nome,
-                    arrendatario_nome,
-                )
-                nome_arquivo = limpar_nome_arquivo(
-                    f"{status_nome} - POR FORNECEDOR - "
-                    f"{arrendatario_nome}.zip"
-                )
-                mime = "application/zip"
+
             else:
-                arquivo_saida = gerar_zip_por_tribunal_e_fornecedor(
-                    df_filtrado,
-                    status_nome,
-                    arrendatario_nome,
+                arquivo_saida = (
+                    gerar_zip_por_tribunal_e_fornecedor(
+                        df_filtrado,
+                        status_nome,
+                        arrendatario_nome,
+                    )
                 )
+
                 nome_arquivo = limpar_nome_arquivo(
-                    f"{status_nome} - FORNECEDOR E TRIBUNAL - "
+                    f"{status_nome} - "
+                    "FORNECEDOR E TRIBUNAL - "
                     f"{arrendatario_nome}.zip"
                 )
                 mime = "application/zip"
@@ -2205,8 +2155,9 @@ else:
             f"Arquivo pronto: {nome_arquivo} "
             f"({len(dados_arquivo) / 1024 / 1024:.2f} MB)"
         )
+
         st.download_button(
-            label=f"📥 Baixar {organizacao.lower()}",
+            label="📥 Baixar arquivo",
             data=dados_arquivo,
             file_name=nome_arquivo,
             mime=mime,
@@ -2217,3 +2168,4 @@ else:
 
         del dados_arquivo
         gc.collect()
+
