@@ -24,19 +24,28 @@ URL_API_PROJURIS = (
 URL_API_ACOMPANHAMENTO = (
     "https://broly.sajadv.com.br/api/acompanhamento"
 )
+URL_API_DIGESTO = (
+    "https://api-hub-processos.projuris.com.br/"
+    "api/v1/capturas/solicitacoes"
+)
+AUTHORIZATION_DIGESTO = (
+    "Basic c3Vwb3J0ZS1hZHY6QVRGS2pxWW90SmlNaWU5VUZrbkVDRkg1OFFpVTlRZWhzM29xcU9pOHRSZz0="
+)
 
 QUANTIDADE_POR_PAGINA = 100
 TIMEOUT_CONEXAO = 15
 TIMEOUT_LEITURA_PROJURIS = 120
 TIMEOUT_LEITURA_ACOMPANHAMENTO = 60
+TIMEOUT_LEITURA_DIGESTO = 30
 MAX_TENTATIVAS_PAGINA = 5
 MAX_TENTATIVAS_DEMANDA = 4
+MAX_TENTATIVAS_DIGESTO = 3
 MAX_THREADS = 3
 INTERVALO_CHECKPOINT = 25
 TAMANHO_LOTE_BROLY = 50
 LIMITE_PREVIA = 30
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v12_fornecedor_only"
+VERSAO_CHECKPOINT = "v13_digesto"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -698,6 +707,95 @@ def interpretar_resposta_broly(resposta):
 
     return id_demanda, status, fornecedor
 
+
+def buscar_dados_digesto(
+    cd_arrendatario,
+    id_central,
+):
+    """
+    Consulta o Hub de Processos para identificar capturas da Digesto.
+
+    O endpoint usa o parâmetro identificador_externo no formato:
+    cdArrendatario=...,cdCentralCapturaProcesso=...
+
+    Retorna:
+    - (True, id_captura_fornecedor, status, link) quando a captura é Digesto;
+    - (False, "N/A", "N/A", link) quando idCapturaFornecedor é nulo;
+    - em caso de erro no endpoint, também retorna False para permitir o
+      fallback normal para o Broly, sem alterar a lógica dos demais fornecedores.
+    """
+    sessao = obter_sessao_thread()
+
+    identificador_externo = (
+        f"cdArrendatario=%3D{cd_arrendatario},"
+        f"cdCentralCapturaProcesso=%3D{id_central}"
+    )
+
+    link_completo = (
+        f"{URL_API_DIGESTO}"
+        f"?identificador_externo={identificador_externo}"
+    )
+
+    for tentativa in range(
+        1,
+        MAX_TENTATIVAS_DIGESTO + 1,
+    ):
+        try:
+            resposta = sessao.get(
+                link_completo,
+                headers={
+                    "Authorization": AUTHORIZATION_DIGESTO,
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                },
+                timeout=(
+                    TIMEOUT_CONEXAO,
+                    TIMEOUT_LEITURA_DIGESTO,
+                ),
+            )
+
+            if resposta.status_code == 200:
+                try:
+                    dados = resposta.json()
+                except ValueError:
+                    return False, "N/A", "N/A", link_completo
+
+                id_captura_fornecedor = dados.get(
+                    "idCapturaFornecedor"
+                )
+
+                if id_captura_fornecedor is not None and str(
+                    id_captura_fornecedor
+                ).strip():
+                    return (
+                        True,
+                        str(id_captura_fornecedor).strip(),
+                        str(dados.get("status") or "N/A").strip(),
+                        link_completo,
+                    )
+
+                return False, "N/A", "N/A", link_completo
+
+            if resposta.status_code in [
+                429,
+                500,
+                502,
+                503,
+                504,
+            ] and tentativa < MAX_TENTATIVAS_DIGESTO:
+                time.sleep(tentativa * 2)
+                continue
+
+            return False, "N/A", "N/A", link_completo
+
+        except requests.exceptions.RequestException:
+            if tentativa < MAX_TENTATIVAS_DIGESTO:
+                time.sleep(tentativa * 2)
+                continue
+
+    return False, "N/A", "N/A", link_completo
+
+
 def buscar_dados_demanda(
     cd_arrendatario,
     id_central,
@@ -850,6 +948,29 @@ def consultar_processo(
 
     try:
         (
+            eh_digesto,
+            id_captura_fornecedor,
+            status_digesto,
+            link_digesto,
+        ) = buscar_dados_digesto(
+            cd_arrendatario,
+            id_central,
+        )
+
+        if eh_digesto:
+            return {
+                "Processo": processo["Processo"],
+                "codigoCentralCapturaProcesso": str(id_central or "N/A"),
+                "Tribunal": processo["Tribunal"],
+                "ID Demanda": id_captura_fornecedor,
+                "Status": status_digesto,
+                "Fornecedor": "DIGESTO",
+                "Link": link_digesto,
+            }
+
+        # Se não for Digesto, segue exatamente pelo fluxo já existente
+        # do Broly para os demais fornecedores.
+        (
             id_demanda,
             status,
             fornecedor,
@@ -887,10 +1008,33 @@ def consultar_processo(
         }
 
 
+def preparar_dataframe_excel(df):
+    """
+    Mantém as colunas atuais para os demais fornecedores.
+    Quando o arquivo contém exclusivamente Digesto, troca o cabeçalho
+    "ID Demanda" por "idCapturaFornecedor", conforme o contrato do endpoint.
+    """
+    df = normalizar_dataframe_resultados(df.copy())
+
+    fornecedores = {
+        str(valor).strip().upper()
+        for valor in df["Fornecedor"].dropna().tolist()
+    }
+
+    if fornecedores == {"DIGESTO"}:
+        df = df.rename(
+            columns={
+                "ID Demanda": "idCapturaFornecedor",
+            }
+        )
+
+    return df
+
+
 def gerar_excel_tribunal(df_tribunal):
     output = BytesIO()
 
-    df_tribunal = normalizar_dataframe_resultados(
+    df_tribunal = preparar_dataframe_excel(
         df_tribunal.copy()
     )
 
