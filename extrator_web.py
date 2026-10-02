@@ -45,7 +45,7 @@ INTERVALO_CHECKPOINT = 25
 TAMANHO_LOTE_BROLY = 50
 LIMITE_PREVIA = 30
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v17_digesto_auth_corrigida"
+VERSAO_CHECKPOINT = "v19_caminho_hub_broly"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -150,6 +150,7 @@ COLUNAS_RESULTADO = [
     "Status",
     "Fornecedor",
     "Link",
+    "Caminho",
 ]
 
 _thread_local = threading.local()
@@ -1010,6 +1011,7 @@ def consultar_processo(
             ),
             "Fornecedor": "N/A",
             "Link": "N/A",
+            "Caminho": "ID CENTRAL NÃO ENCONTRADO",
         }
 
     try:
@@ -1033,6 +1035,7 @@ def consultar_processo(
                 "Status": status_digesto,
                 "Fornecedor": "DIGESTO",
                 "Link": link_digesto,
+                "Caminho": "HUB → DIGESTO (idCapturaFornecedor preenchido)",
             }
 
         # Se não for Digesto, segue exatamente pelo fluxo já existente
@@ -1055,6 +1058,9 @@ def consultar_processo(
             "Status": status,
             "Fornecedor": fornecedor,
             "Link": link,
+            "Caminho": (
+                "HUB → " + diagnostico_hub + " → BROLY"
+            ),
         }
 
     except Exception as erro:
@@ -1072,6 +1078,7 @@ def consultar_processo(
                 cd_arrendatario,
                 id_central,
             ),
+            "Caminho": "ERRO INESPERADO ANTES DA CONCLUSÃO DO FLUXO",
         }
 
 
