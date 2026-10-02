@@ -45,7 +45,7 @@ INTERVALO_CHECKPOINT = 25
 TAMANHO_LOTE_BROLY = 50
 LIMITE_PREVIA = 30
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v19_caminho_hub_broly"
+VERSAO_CHECKPOINT = "v20_diagnostico_url_hub"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -813,7 +813,10 @@ def buscar_dados_digesto(
 
                 ultimo_diagnostico = (
                     "HUB RESPONDEU 200, MAS "
-                    "idCapturaFornecedor É NULL E fornecedor NÃO É DIGESTO"
+                    "idCapturaFornecedor É NULL E fornecedor NÃO É DIGESTO | "
+                    f"cdArrendatario={cd_arrendatario} | "
+                    f"cdCentralCapturaProcesso={id_central} | "
+                    f"URL={link_completo}"
                 )
                 return (
                     False,
@@ -823,8 +826,13 @@ def buscar_dados_digesto(
                     ultimo_diagnostico,
                 )
 
+            corpo_resposta = (resposta.text or "").strip().replace("\n", " ")[:300]
             ultimo_diagnostico = (
-                f"HUB HTTP {resposta.status_code}"
+                f"HUB HTTP {resposta.status_code} | "
+                f"cdArrendatario={cd_arrendatario} | "
+                f"cdCentralCapturaProcesso={id_central} | "
+                f"URL={link_completo} | "
+                f"Resposta={corpo_resposta}"
             )
 
             if resposta.status_code in [
