@@ -45,7 +45,7 @@ INTERVALO_CHECKPOINT = 25
 TAMANHO_LOTE_BROLY = 50
 LIMITE_PREVIA = 30
 PAUSA_ENTRE_PAGINAS = 0.5
-VERSAO_CHECKPOINT = "v14_digesto_hub_prioridade"
+VERSAO_CHECKPOINT = "v16_digesto_hub_url_exata"
 
 try:
     TOKEN_FORNECEDOR = st.secrets["TOKEN_FORNECEDOR"]
@@ -712,33 +712,30 @@ def buscar_dados_digesto(
     cd_arrendatario,
     id_central,
 ):
-    """
-    Consulta o Hub de Processos para identificar capturas da Digesto.
+    """Consulta o Hub antes do Broly.
 
-    O endpoint usa o parâmetro identificador_externo no formato:
-    cdArrendatario=...,cdCentralCapturaProcesso=...
+    O Hub é a fonte prioritária para identificar uma captura Digesto.
+    Se o Hub retornar fornecedor=digesto OU idCapturaFornecedor preenchido,
+    o processo é tratado como Digesto.
 
     Retorna:
-    - (True, id_captura_fornecedor, status, link) quando a captura é Digesto;
-    - (False, "N/A", "N/A", link) quando idCapturaFornecedor é nulo;
-    - em caso de erro no endpoint, também retorna False para permitir o
-      fallback normal para o Broly, sem alterar a lógica dos demais fornecedores.
+        (eh_digesto, id_captura_fornecedor, status, link_hub, diagnostico)
     """
     sessao = obter_sessao_thread()
 
-    # O valor do parâmetro deve ser montado sem codificação manual.
-    # O requests fará a codificação correta, resultando em:
-    # identificador_externo=cdArrendatario%3D126885%2CcdCentralCapturaProcesso%3D3306277
+    # Envia exatamente o formato usado no cURL funcional, com os caracteres
+    # '=' e ',' do valor codificados explicitamente como %3D e %2C.
     identificador_externo = (
-        f"cdArrendatario={cd_arrendatario},"
-        f"cdCentralCapturaProcesso={id_central}"
+        f"cdArrendatario=%3D{cd_arrendatario}"
+        f"%2CcdCentralCapturaProcesso=%3D{id_central}"
     )
 
     link_completo = (
         f"{URL_API_DIGESTO}"
-        f"?identificador_externo="
-        f"{identificador_externo}"
+        f"?identificador_externo={identificador_externo}"
     )
+
+    ultimo_diagnostico = "HUB SEM RESPOSTA"
 
     for tentativa in range(
         1,
@@ -746,10 +743,7 @@ def buscar_dados_digesto(
     ):
         try:
             resposta = sessao.get(
-                URL_API_DIGESTO,
-                params={
-                    "identificador_externo": identificador_externo,
-                },
+                link_completo,
                 headers={
                     "Authorization": AUTHORIZATION_DIGESTO,
                     "Accept": "application/json",
@@ -765,23 +759,72 @@ def buscar_dados_digesto(
                 try:
                     dados = resposta.json()
                 except ValueError:
-                    return False, "N/A", "N/A", link_completo
-
-                id_captura_fornecedor = dados.get(
-                    "idCapturaFornecedor"
-                )
-
-                if id_captura_fornecedor is not None and str(
-                    id_captura_fornecedor
-                ).strip():
                     return (
-                        True,
-                        str(id_captura_fornecedor).strip(),
-                        str(dados.get("status") or "N/A").strip(),
+                        False,
+                        "N/A",
+                        "N/A",
                         link_completo,
+                        "HUB RETORNOU JSON INVÁLIDO",
                     )
 
-                return False, "N/A", "N/A", link_completo
+                # O endpoint pode eventualmente retornar um objeto ou uma
+                # lista. Aceitamos ambos sem alterar o fluxo do Broly.
+                registros = (
+                    dados if isinstance(dados, list) else [dados]
+                )
+
+                for registro in registros:
+                    if not isinstance(registro, dict):
+                        continue
+
+                    fornecedor_hub = str(
+                        registro.get("fornecedor") or ""
+                    ).strip().lower()
+
+                    id_captura_fornecedor = registro.get(
+                        "idCapturaFornecedor"
+                    )
+
+                    id_captura_preenchido = (
+                        id_captura_fornecedor is not None
+                        and str(id_captura_fornecedor).strip() != ""
+                        and str(id_captura_fornecedor).strip().lower()
+                        != "null"
+                    )
+
+                    if fornecedor_hub == "digesto" or id_captura_preenchido:
+                        return (
+                            True,
+                            str(id_captura_fornecedor).strip()
+                            if id_captura_preenchido
+                            else "N/A",
+                            str(
+                                registro.get("status") or "N/A"
+                            ).strip(),
+                            link_completo,
+                            (
+                                "HUB CONFIRMOU DIGESTO | "
+                                f"fornecedor={fornecedor_hub or 'N/A'} | "
+                                f"idCapturaFornecedor="
+                                f"{id_captura_fornecedor or 'N/A'}"
+                            ),
+                        )
+
+                ultimo_diagnostico = (
+                    "HUB RESPONDEU 200, MAS "
+                    "idCapturaFornecedor É NULL E fornecedor NÃO É DIGESTO"
+                )
+                return (
+                    False,
+                    "N/A",
+                    "N/A",
+                    link_completo,
+                    ultimo_diagnostico,
+                )
+
+            ultimo_diagnostico = (
+                f"HUB HTTP {resposta.status_code}"
+            )
 
             if resposta.status_code in [
                 429,
@@ -793,15 +836,31 @@ def buscar_dados_digesto(
                 time.sleep(tentativa * 2)
                 continue
 
-            return False, "N/A", "N/A", link_completo
+            return (
+                False,
+                "N/A",
+                "N/A",
+                link_completo,
+                ultimo_diagnostico,
+            )
 
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as erro:
+            ultimo_diagnostico = (
+                "ERRO AO CONSULTAR HUB: "
+                f"{erro}"
+            )
+
             if tentativa < MAX_TENTATIVAS_DIGESTO:
                 time.sleep(tentativa * 2)
                 continue
 
-    return False, "N/A", "N/A", link_completo
-
+    return (
+        False,
+        "N/A",
+        "N/A",
+        link_completo,
+        ultimo_diagnostico,
+    )
 
 def buscar_dados_demanda(
     cd_arrendatario,
@@ -959,6 +1018,7 @@ def consultar_processo(
             id_captura_fornecedor,
             status_digesto,
             link_digesto,
+            diagnostico_hub,
         ) = buscar_dados_digesto(
             cd_arrendatario,
             id_central,
