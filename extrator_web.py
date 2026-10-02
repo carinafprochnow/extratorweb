@@ -726,14 +726,12 @@ def buscar_dados_digesto(
 
     # Envia exatamente o formato usado no cURL funcional, com os caracteres
     # '=' e ',' do valor codificados explicitamente como %3D e %2C.
-    identificador_externo = (
+    # URL exatamente no mesmo formato do cURL funcional:
+    # ...?identificador_externo=cdArrendatario%3D126885%2CcdCentralCapturaProcesso%3D3306277
+    link_completo = (
+        f"{URL_API_DIGESTO}?identificador_externo="
         f"cdArrendatario%3D{cd_arrendatario}"
         f"%2CcdCentralCapturaProcesso%3D{id_central}"
-    )
-
-    link_completo = (
-        f"{URL_API_DIGESTO}"
-        f"?identificador_externo={identificador_externo}"
     )
 
     ultimo_diagnostico = "HUB SEM RESPOSTA"
