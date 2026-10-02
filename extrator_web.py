@@ -726,14 +726,18 @@ def buscar_dados_digesto(
     """
     sessao = obter_sessao_thread()
 
+    # O valor do parâmetro deve ser montado sem codificação manual.
+    # O requests fará a codificação correta, resultando em:
+    # identificador_externo=cdArrendatario%3D126885%2CcdCentralCapturaProcesso%3D3306277
     identificador_externo = (
-        f"cdArrendatario=%3D{cd_arrendatario},"
-        f"cdCentralCapturaProcesso=%3D{id_central}"
+        f"cdArrendatario={cd_arrendatario},"
+        f"cdCentralCapturaProcesso={id_central}"
     )
 
     link_completo = (
         f"{URL_API_DIGESTO}"
-        f"?identificador_externo={identificador_externo}"
+        f"?identificador_externo="
+        f"{identificador_externo}"
     )
 
     for tentativa in range(
@@ -742,7 +746,10 @@ def buscar_dados_digesto(
     ):
         try:
             resposta = sessao.get(
-                link_completo,
+                URL_API_DIGESTO,
+                params={
+                    "identificador_externo": identificador_externo,
+                },
                 headers={
                     "Authorization": AUTHORIZATION_DIGESTO,
                     "Accept": "application/json",
