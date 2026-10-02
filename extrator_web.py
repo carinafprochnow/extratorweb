@@ -727,8 +727,8 @@ def buscar_dados_digesto(
     # Envia exatamente o formato usado no cURL funcional, com os caracteres
     # '=' e ',' do valor codificados explicitamente como %3D e %2C.
     identificador_externo = (
-        f"cdArrendatario=%3D{cd_arrendatario}"
-        f"%2CcdCentralCapturaProcesso=%3D{id_central}"
+        f"cdArrendatario%3D{cd_arrendatario}"
+        f"%2CcdCentralCapturaProcesso%3D{id_central}"
     )
 
     link_completo = (
